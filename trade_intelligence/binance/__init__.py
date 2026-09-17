@@ -1,4 +1,4 @@
-"""Trade Intelligence - Binance Market Data Engine."""
+"""Binance API access module."""
 
 from trade_intelligence.binance.client import BinanceRestClient
 from trade_intelligence.binance.enums import KlineInterval
@@ -10,8 +10,13 @@ from trade_intelligence.binance.exceptions import (
     BinanceResponseError,
     BinanceTimeoutError,
 )
-
-__version__ = "0.1.0"
+from trade_intelligence.binance.models import (
+    ExchangeInfo,
+    Kline,
+    PriceTicker,
+    ServerTime,
+    SymbolInfo,
+)
 
 __all__ = [
     "BinanceRestClient",
@@ -22,4 +27,9 @@ __all__ = [
     "BinanceHttpError",
     "BinanceApiError",
     "BinanceResponseError",
+    "ServerTime",
+    "SymbolInfo",
+    "ExchangeInfo",
+    "PriceTicker",
+    "Kline",
 ]
