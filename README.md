@@ -1,24 +1,26 @@
 # Trade Intelligence
 
-Trade Intelligence is a local market-data ingestion and intelligence system focused exclusively on Binance market data.
+Trade Intelligence is a private, Binance-only trading intelligence application. The current focus is building the market-data foundation.
 
-## Project Scope & Constraints
+## Project Scope & Boundaries
 
 - **Exchange**: Binance only
 - **Data Access**: Binance official public market-data APIs
-- **Database**: SQLite (planned for subsequent phases; not implemented yet)
+- **Database**: SQLite (planned for Phase 1.3; not implemented yet)
 - **Deployment**: Local initially
-- **Trading**: Completely disabled (no execution, order routing, or portfolio management)
+- **Trading**: Completely disabled (no execution, order routing, or account management)
 - **API Credentials**: Not required (read-only public market data only)
-- **Out of Scope**: No AI/ML, trading recommendations, automated trading, technical analysis engines, Binance Square integrations, or frontend in this phase.
+- **Out of Scope**: No AI/ML, trading recommendations, automated trading, technical analysis engines, candlestick detection, Binance Square integrations, WebSockets, Futures, or frontend.
 
-## Current Phase: Phase 1.1
+## Current State: Phase 1.2 (Completed)
 
-Phase 1.1 focuses strictly on initializing the backend development environment:
-- Establishing a clean Python package layout (`src/trade_intelligence/`)
-- Setting up a local Python virtual environment (`.venv`)
-- Defining minimal dependencies required for public REST API market-data connectivity
-- Establishing repository `.gitignore` and workspace documentation
+Phase 1.2 provides a robust, isolated Binance Spot public REST API client (`BinanceRestClient`):
+- **Endpoints Supported**: Server time (`GET /api/v3/time`), exchange information (`GET /api/v3/exchangeInfo`), ticker prices (`GET /api/v3/ticker/price`), and kline/OHLCV data (`GET /api/v3/klines`).
+- **Supported Kline Intervals**: `5m`, `15m`, `1h`, `4h`, and `1d` with strict interval validation.
+- **Financial Precision**: Uses standard library `decimal.Decimal` for all normalized price and volume fields, avoiding IEEE-754 binary floating-point rounding errors.
+- **Raw Data Preservation**: Preserves untouched Binance response payloads in `.raw` for debugging and future data archival.
+- **Error Handling**: Custom exception hierarchy (`BinanceConnectionError`, `BinanceTimeoutError`, `BinanceHttpError`, `BinanceApiError`, `BinanceResponseError`) with safe parsing of non-integer error codes.
+- **Client Validation**: Enforces kline limit boundaries (1 <= limit <= 1000).
 
 ## Development Setup
 
@@ -43,14 +45,34 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### 4. Running Tests
+Run the deterministic offline unit test suite:
+```powershell
+python -m unittest discover -s tests
+```
+
+Run the live Binance integration tests (opt-in, requires internet connectivity):
+```powershell
+$env:RUN_LIVE_TESTS="1"; python -m unittest tests/test_binance_integration.py
+```
+
 ## Project Structure
 ```text
 Trade-Intelligence/
-├── .gitignore          # Git exclusion rules
-├── README.md           # Project documentation and Phase 1.1 scope
-├── requirements.txt    # Minimal dependencies for Binance public API
-├── trade_intelligence/
-│   └── __init__.py     # Core package root
-└── tests/
-    └── __init__.py     # Test suite root
+├── .gitignore                          # Git exclusion rules
+├── README.md                           # Project documentation
+├── requirements.txt                    # Minimal dependencies for Binance public API
+├── tests/
+│   ├── __init__.py
+│   ├── test_environment.py          # Environment & dependency sanity checks
+│   ├── test_binance_client.py       # Mocked offline unit tests
+│   └── test_binance_integration.py  # Opt-in live Binance API integration tests
+└── trade_intelligence/
+    ├── __init__.py                  # Top-level exports
+    └── binance/
+        ├── __init__.py              # Binance module interface
+        ├── client.py                # BinanceRestClient implementation
+        ├── enums.py                 # KlineInterval enumeration & validation
+        ├── exceptions.py            # Custom exception hierarchy
+        └── models.py                # Typed dataclasses (Decimal prices/volumes)
 ```

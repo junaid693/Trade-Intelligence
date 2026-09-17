@@ -1,6 +1,6 @@
 """Custom exception hierarchy for the Binance REST client."""
 
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 
 class BinanceClientError(Exception):
@@ -28,7 +28,13 @@ class BinanceHttpError(BinanceClientError):
 class BinanceApiError(BinanceHttpError):
     """Raised when Binance returns a structured error payload (code and msg)."""
 
-    def __init__(self, code: int, msg: str, status_code: int = 400, raw_response: Optional[Any] = None):
+    def __init__(
+        self,
+        code: Union[int, str],
+        msg: str,
+        status_code: int = 400,
+        raw_response: Optional[Any] = None,
+    ):
         super().__init__(
             status_code=status_code,
             message=f"[{code}] {msg}",

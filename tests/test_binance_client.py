@@ -1,5 +1,7 @@
 """Unit tests for BinanceRestClient using mocked HTTP responses."""
 
+from decimal import Decimal
+from typing import Any, Optional
 import unittest
 from unittest.mock import MagicMock, patch
 import requests
@@ -23,7 +25,9 @@ from trade_intelligence.binance.models import (
 )
 
 
-def _make_mock_response(status_code: int = 200, json_data: any = None, text: str = "") -> MagicMock:
+def _make_mock_response(
+    status_code: int = 200, json_data: Optional[Any] = None, text: str = ""
+) -> MagicMock:
     """Helper to construct a mock requests.Response."""
     mock_resp = MagicMock(spec=requests.Response)
     mock_resp.status_code = status_code
@@ -156,7 +160,8 @@ class TestBinanceRestClient(unittest.TestCase):
 
         self.assertIsInstance(result, PriceTicker)
         self.assertEqual(result.symbol, "BTCUSDT")
-        self.assertEqual(result.price, 67890.50)
+        self.assertIsInstance(result.price, Decimal)
+        self.assertEqual(result.price, Decimal("67890.50"))
         self.assertEqual(result.raw["price"], "67890.50")
         mock_request.assert_called_once_with(
             method="GET",
@@ -180,9 +185,11 @@ class TestBinanceRestClient(unittest.TestCase):
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0].symbol, "BTCUSDT")
-        self.assertEqual(result[0].price, 67890.50)
+        self.assertIsInstance(result[0].price, Decimal)
+        self.assertEqual(result[0].price, Decimal("67890.50"))
         self.assertEqual(result[1].symbol, "ETHUSDT")
-        self.assertEqual(result[1].price, 3500.25)
+        self.assertIsInstance(result[1].price, Decimal)
+        self.assertEqual(result[1].price, Decimal("3500.25"))
 
     @patch.object(requests.Session, "request")
     def test_get_klines_all_five_supported_intervals(self, mock_request):
@@ -202,16 +209,24 @@ class TestBinanceRestClient(unittest.TestCase):
                 kline = klines[0]
                 self.assertIsInstance(kline, Kline)
                 self.assertEqual(kline.open_time_ms, 1499040000000)
-                self.assertEqual(kline.open, 0.01634790)
-                self.assertEqual(kline.high, 0.80000000)
-                self.assertEqual(kline.low, 0.01575800)
-                self.assertEqual(kline.close, 0.01577100)
-                self.assertEqual(kline.volume, 148976.11427815)
+                self.assertIsInstance(kline.open, Decimal)
+                self.assertEqual(kline.open, Decimal("0.01634790"))
+                self.assertIsInstance(kline.high, Decimal)
+                self.assertEqual(kline.high, Decimal("0.80000000"))
+                self.assertIsInstance(kline.low, Decimal)
+                self.assertEqual(kline.low, Decimal("0.01575800"))
+                self.assertIsInstance(kline.close, Decimal)
+                self.assertEqual(kline.close, Decimal("0.01577100"))
+                self.assertIsInstance(kline.volume, Decimal)
+                self.assertEqual(kline.volume, Decimal("148976.11427815"))
                 self.assertEqual(kline.close_time_ms, 1499644799999)
-                self.assertEqual(kline.quote_asset_volume, 2434.19055334)
+                self.assertIsInstance(kline.quote_asset_volume, Decimal)
+                self.assertEqual(kline.quote_asset_volume, Decimal("2434.19055334"))
                 self.assertEqual(kline.trades, 308)
-                self.assertEqual(kline.taker_buy_base_asset_volume, 1756.87402397)
-                self.assertEqual(kline.taker_buy_quote_asset_volume, 28.46694368)
+                self.assertIsInstance(kline.taker_buy_base_asset_volume, Decimal)
+                self.assertEqual(kline.taker_buy_base_asset_volume, Decimal("1756.87402397"))
+                self.assertIsInstance(kline.taker_buy_quote_asset_volume, Decimal)
+                self.assertEqual(kline.taker_buy_quote_asset_volume, Decimal("28.46694368"))
                 self.assertEqual(kline.raw, SAMPLE_RAW_KLINE)
 
     @patch.object(requests.Session, "request")
@@ -338,6 +353,93 @@ class TestBinanceRestClient(unittest.TestCase):
         )
         with self.assertRaises(BinanceResponseError):
             self.client.get_klines("BTCUSDT", "1h")
+
+    def test_decimal_precision_preservation(self):
+        """Verify high-precision decimals and binary-float problematic values (0.1, satoshis)."""
+        # 0.1 problem in IEEE-754: 0.1 + 0.2 != 0.3 in float
+        ticker1 = PriceTicker.from_raw({"symbol": "TEST1", "price": "0.1"})
+        ticker2 = PriceTicker.from_raw({"symbol": "TEST2", "price": "0.2"})
+        self.assertIsInstance(ticker1.price, Decimal)
+        self.assertIsInstance(ticker2.price, Decimal)
+        self.assertEqual(ticker1.price + ticker2.price, Decimal("0.3"))
+        self.assertEqual(str(ticker1.price), "0.1")
+
+        # 8-decimal satoshi / low-cap crypto price
+        ticker_sats = PriceTicker.from_raw({"symbol": "SHIBUSDT", "price": "0.00000001"})
+        self.assertEqual(ticker_sats.price, Decimal("0.00000001"))
+        self.assertEqual(f"{ticker_sats.price:f}", "0.00000001")
+        self.assertEqual(ticker_sats.raw["price"], "0.00000001")
+
+        # High precision kline values
+        raw_kline = list(SAMPLE_RAW_KLINE)
+        raw_kline[1] = "0.00000007"
+        raw_kline[4] = "0.00000009"
+        kline = Kline.from_raw(raw_kline)
+        self.assertEqual(kline.open, Decimal("0.00000007"))
+        self.assertEqual(kline.close, Decimal("0.00000009"))
+        self.assertEqual(kline.close - kline.open, Decimal("0.00000002"))
+
+    @patch.object(requests.Session, "request")
+    def test_get_klines_limit_validation(self, mock_request):
+        """Verify klines limit parameter range validation (1 <= limit <= 1000)."""
+        # Invalid limits should raise ValueError before making HTTP call
+        with self.assertRaises(ValueError) as ctx:
+            self.client.get_klines("BTCUSDT", "1h", limit=0)
+        self.assertIn("Invalid limit: 0", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            self.client.get_klines("BTCUSDT", "1h", limit=1001)
+        self.assertIn("Invalid limit: 1001", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            self.client.get_klines("BTCUSDT", "1h", limit=-5)
+
+        mock_request.assert_not_called()
+
+        # Valid boundaries: limit=1 and limit=1000
+        mock_request.return_value = _make_mock_response(json_data=[SAMPLE_RAW_KLINE])
+
+        self.client.get_klines("BTCUSDT", "1h", limit=1)
+        mock_request.assert_called_with(
+            method="GET",
+            url="https://api.binance.test/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1h", "limit": 1},
+            timeout=5.0,
+        )
+
+        self.client.get_klines("BTCUSDT", "1h", limit=1000)
+        mock_request.assert_called_with(
+            method="GET",
+            url="https://api.binance.test/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1h", "limit": 1000},
+            timeout=5.0,
+        )
+
+        # limit=None preserves default behavior (no limit param sent)
+        self.client.get_klines("BTCUSDT", "1h", limit=None)
+        mock_request.assert_called_with(
+            method="GET",
+            url="https://api.binance.test/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1h"},
+            timeout=5.0,
+        )
+
+    @patch.object(requests.Session, "request")
+    def test_non_integer_binance_api_error_handling(self, mock_request):
+        """Verify unexpected non-integer API error code does not leak ValueError."""
+        mock_request.return_value = _make_mock_response(
+            status_code=504,
+            json_data={"code": "GATEWAY_TIMEOUT", "msg": "Upstream timeout"},
+        )
+
+        with self.assertRaises(BinanceApiError) as ctx:
+            self.client.get_server_time()
+
+        err = ctx.exception
+        self.assertEqual(err.code, "GATEWAY_TIMEOUT")
+        self.assertEqual(err.msg, "Upstream timeout")
+        self.assertEqual(err.status_code, 504)
+        self.assertIn("[GATEWAY_TIMEOUT] Upstream timeout", str(err))
 
 
 if __name__ == "__main__":

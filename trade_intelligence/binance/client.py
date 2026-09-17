@@ -124,8 +124,13 @@ class BinanceRestClient:
         # Check for Binance API errors (typically with HTTP >= 400 or containing "code" and "msg")
         if not response.ok or (isinstance(data, dict) and "code" in data and "msg" in data and data["code"] != 0):
             if isinstance(data, dict) and "code" in data and "msg" in data:
+                raw_code = data["code"]
+                try:
+                    code: Union[int, str] = int(raw_code)
+                except (ValueError, TypeError):
+                    code = str(raw_code)
                 raise BinanceApiError(
-                    code=int(data["code"]),
+                    code=code,
                     msg=str(data["msg"]),
                     status_code=response.status_code,
                     raw_response=data,
@@ -224,6 +229,10 @@ class BinanceRestClient:
         if end_time is not None:
             params["endTime"] = int(end_time)
         if limit is not None:
+            if not isinstance(limit, int) or limit < 1 or limit > 1000:
+                raise ValueError(
+                    f"Invalid limit: {limit}. Limit must be an integer between 1 and 1000."
+                )
             params["limit"] = int(limit)
 
         data = self._request("GET", "/api/v3/klines", params=params)

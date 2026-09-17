@@ -2,15 +2,27 @@
 
 These tests make real network requests to Binance's public REST API.
 No API keys or authentication required.
+
+By default, these live tests are skipped during standard test discovery.
+To run them, set the environment variable RUN_LIVE_TESTS=1:
+    PowerShell: $env:RUN_LIVE_TESTS="1"; python -m unittest discover -s tests
+    Bash:       RUN_LIVE_TESTS=1 python3 -m unittest discover -s tests
 """
 
+from decimal import Decimal
+import os
 import unittest
+
 from trade_intelligence.binance.client import BinanceRestClient
 from trade_intelligence.binance.enums import KlineInterval
 from trade_intelligence.binance.exceptions import BinanceApiError, BinanceTimeoutError
 from trade_intelligence.binance.models import ExchangeInfo, Kline, PriceTicker, ServerTime
 
 
+@unittest.skipUnless(
+    os.getenv("RUN_LIVE_TESTS") == "1",
+    "Live Binance integration tests are disabled by default. Set RUN_LIVE_TESTS=1 to run.",
+)
 class TestBinanceIntegration(unittest.TestCase):
     """Live connectivity tests for Binance public REST API."""
 
@@ -49,8 +61,8 @@ class TestBinanceIntegration(unittest.TestCase):
         ticker = self.client.get_ticker_price("BTCUSDT")
         self.assertIsInstance(ticker, PriceTicker)
         self.assertEqual(ticker.symbol, "BTCUSDT")
-        self.assertIsInstance(ticker.price, float)
-        self.assertGreater(ticker.price, 0.0)
+        self.assertIsInstance(ticker.price, Decimal)
+        self.assertGreater(ticker.price, Decimal("0"))
         self.assertIn("price", ticker.raw)
 
     def test_live_klines_all_five_intervals_btcusdt(self):
@@ -71,12 +83,13 @@ class TestBinanceIntegration(unittest.TestCase):
                     self.assertIsInstance(kline, Kline)
                     self.assertGreater(kline.open_time_ms, 0)
                     self.assertGreater(kline.close_time_ms, kline.open_time_ms)
-                    self.assertGreater(kline.open, 0.0)
-                    self.assertGreater(kline.high, 0.0)
-                    self.assertGreater(kline.low, 0.0)
-                    self.assertGreater(kline.close, 0.0)
+                    self.assertIsInstance(kline.open, Decimal)
+                    self.assertGreater(kline.open, Decimal("0"))
+                    self.assertGreater(kline.high, Decimal("0"))
+                    self.assertGreater(kline.low, Decimal("0"))
+                    self.assertGreater(kline.close, Decimal("0"))
                     self.assertGreaterEqual(kline.high, kline.low)
-                    self.assertGreaterEqual(kline.volume, 0.0)
+                    self.assertGreaterEqual(kline.volume, Decimal("0"))
                     self.assertIsInstance(kline.raw, list)
                     self.assertGreaterEqual(len(kline.raw), 11)
 

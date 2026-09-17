@@ -1,6 +1,7 @@
 """Typed Python data models for normalized Binance REST API responses."""
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 from trade_intelligence.binance.exceptions import BinanceResponseError
 
@@ -95,7 +96,7 @@ class PriceTicker:
     """Normalized price ticker."""
 
     symbol: str
-    price: float
+    price: Decimal
     raw: Dict[str, Any]
 
     @classmethod
@@ -105,10 +106,10 @@ class PriceTicker:
         try:
             return cls(
                 symbol=str(data["symbol"]),
-                price=float(data["price"]),
+                price=Decimal(str(data["price"])),
                 raw=data,
             )
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, InvalidOperation) as exc:
             raise BinanceResponseError(f"Failed to parse price ticker: {exc}") from exc
 
 
@@ -117,16 +118,16 @@ class Kline:
     """Normalized Kline / OHLCV candlestick data."""
 
     open_time_ms: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
     close_time_ms: int
-    quote_asset_volume: float
+    quote_asset_volume: Decimal
     trades: int
-    taker_buy_base_asset_volume: float
-    taker_buy_quote_asset_volume: float
+    taker_buy_base_asset_volume: Decimal
+    taker_buy_quote_asset_volume: Decimal
     raw: List[Any]
 
     @classmethod
@@ -138,17 +139,17 @@ class Kline:
         try:
             return cls(
                 open_time_ms=int(data[0]),
-                open=float(data[1]),
-                high=float(data[2]),
-                low=float(data[3]),
-                close=float(data[4]),
-                volume=float(data[5]),
+                open=Decimal(str(data[1])),
+                high=Decimal(str(data[2])),
+                low=Decimal(str(data[3])),
+                close=Decimal(str(data[4])),
+                volume=Decimal(str(data[5])),
                 close_time_ms=int(data[6]),
-                quote_asset_volume=float(data[7]),
+                quote_asset_volume=Decimal(str(data[7])),
                 trades=int(data[8]),
-                taker_buy_base_asset_volume=float(data[9]),
-                taker_buy_quote_asset_volume=float(data[10]),
+                taker_buy_base_asset_volume=Decimal(str(data[9])),
+                taker_buy_quote_asset_volume=Decimal(str(data[10])),
                 raw=list(data),
             )
-        except (ValueError, TypeError, IndexError) as exc:
+        except (ValueError, TypeError, IndexError, InvalidOperation) as exc:
             raise BinanceResponseError(f"Failed to parse kline entry: {exc}") from exc
