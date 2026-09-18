@@ -1,0 +1,785 @@
+"""SQLite database foundation for Trade Intelligence.
+
+Provides connection management, schema initialization, and repository methods
+for all approved Phase 1.3.1 tables. Financial values are stored as TEXT
+(Python Decimal) and timestamps as INTEGER (UTC epoch milliseconds).
+"""
+
+import hashlib
+import json
+import sqlite3
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from trade_intelligence.db.exceptions import (
+    DatabaseError,
+    DatabaseInitError,
+    DatabaseIntegrityError,
+)
+from trade_intelligence.db.schema import SCHEMA_SQL, SCHEMA_VERSION
+
+# Default SQLite pragmas for operational performance.
+# These are configurable via the Database constructor.
+DEFAULT_PRAGMAS: Dict[str, Any] = {
+    "journal_mode": "WAL",
+    "synchronous": "NORMAL",
+    "cache_size": -64000,  # 64 MB (negative = KiB)
+    "busy_timeout": 5000,  # 5 seconds
+    "foreign_keys": 1,     # Always enforced
+}
+
+
+class Database:
+    """SQLite database manager for Trade Intelligence.
+
+    Manages connection lifecycle, schema initialization, and provides
+    repository methods for all Phase 1.3.1 tables.
+
+    Usage::
+
+        db = Database("trade_intelligence.db")
+        db.connect()
+        db.initialize()
+        # ... use repository methods ...
+        db.close()
+
+    Or as a context manager::
+
+        with Database("trade_intelligence.db") as db:
+            db.initialize()
+            # ... use repository methods ...
+    """
+
+    def __init__(
+        self,
+        db_path: Union[str, Path],
+        pragmas: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Initialize the database manager.
+
+        Args:
+            db_path: Path to the SQLite database file. Use ":memory:" for
+                     in-memory databases (useful for testing).
+            pragmas: Optional dict of SQLite PRAGMA settings to override
+                     defaults. The ``foreign_keys`` pragma is always forced
+                     to 1 regardless of caller input.
+        """
+        self._db_path = str(db_path)
+        self._pragmas = dict(DEFAULT_PRAGMAS)
+        if pragmas:
+            self._pragmas.update(pragmas)
+        # Foreign keys are non-negotiable
+        self._pragmas["foreign_keys"] = 1
+        self._conn: Optional[sqlite3.Connection] = None
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    def connect(self) -> None:
+        """Open a connection to the SQLite database and apply pragmas.
+
+        Raises:
+            DatabaseError: If the connection cannot be established.
+        """
+        if self._conn is not None:
+            return
+        try:
+            self._conn = sqlite3.connect(self._db_path)
+            self._conn.row_factory = sqlite3.Row
+            self._apply_pragmas()
+        except sqlite3.Error as exc:
+            self._conn = None
+            raise DatabaseError(f"Failed to connect to database: {exc}") from exc
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            finally:
+                self._conn = None
+
+    def __enter__(self) -> "Database":
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Return the active connection, raising if not connected.
+
+        Raises:
+            DatabaseError: If not connected.
+        """
+        if self._conn is None:
+            raise DatabaseError("Database is not connected. Call connect() first.")
+        return self._conn
+
+    def _apply_pragmas(self) -> None:
+        """Apply configured PRAGMA settings to the active connection."""
+        conn = self.connection
+        for pragma, value in self._pragmas.items():
+            conn.execute(f"PRAGMA {pragma} = {value};")
+
+    # ------------------------------------------------------------------
+    # Schema management
+    # ------------------------------------------------------------------
+
+    def initialize(self) -> None:
+        """Create all tables and record the schema version.
+
+        Safe to call multiple times (uses CREATE TABLE IF NOT EXISTS).
+
+        Raises:
+            DatabaseInitError: If schema creation fails.
+        """
+        conn = self.connection
+        try:
+            conn.executescript(SCHEMA_SQL)
+            # Record schema version if not already recorded
+            existing = self.get_schema_version()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?);",
+                    (SCHEMA_VERSION,),
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise DatabaseInitError(
+                f"Failed to initialize database schema: {exc}"
+            ) from exc
+
+    def get_schema_version(self) -> Optional[int]:
+        """Return the current schema version, or None if not yet recorded.
+
+        Raises:
+            DatabaseError: If the query fails.
+        """
+        conn = self.connection
+        try:
+            row = conn.execute(
+                "SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1;"
+            ).fetchone()
+            return row["version"] if row else None
+        except sqlite3.OperationalError:
+            # Table does not exist yet
+            return None
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to read schema version: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Repository: symbols
+    # ------------------------------------------------------------------
+
+    def insert_symbol(
+        self,
+        symbol: str,
+        base_asset: str,
+        quote_asset: str,
+        status: str,
+        is_spot_trading_allowed: bool,
+        is_margin_trading_allowed: bool,
+        base_asset_precision: int,
+        quote_asset_precision: int,
+        updated_at: int,
+    ) -> None:
+        """Insert or update a symbol record.
+
+        Uses INSERT ... ON CONFLICT DO UPDATE to perform an in-place update
+        when the symbol already exists. This preserves foreign-key
+        relationships from child tables (klines, symbol_status_events,
+        ticker_snapshots) that reference symbols(symbol).
+
+        Note: INSERT OR REPLACE must NOT be used here because it performs
+        a DELETE + INSERT internally, which would violate FK constraints
+        from child rows or, if CASCADE were enabled, silently destroy
+        all associated data.
+
+        Args:
+            symbol: Trading pair symbol (e.g. 'BTCUSDT').
+            base_asset: Base asset name (e.g. 'BTC').
+            quote_asset: Quote asset name (e.g. 'USDT').
+            status: Symbol status (e.g. 'TRADING', 'BREAK').
+            is_spot_trading_allowed: Whether spot trading is enabled.
+            is_margin_trading_allowed: Whether margin trading is enabled.
+            base_asset_precision: Decimal precision for the base asset.
+            quote_asset_precision: Decimal precision for the quote asset.
+            updated_at: UTC epoch milliseconds when this state was observed.
+
+        Raises:
+            DatabaseError: If the insert fails.
+        """
+        conn = self.connection
+        try:
+            conn.execute(
+                """
+                INSERT INTO symbols
+                    (symbol, base_asset, quote_asset, status,
+                     is_spot_trading_allowed, is_margin_trading_allowed,
+                     base_asset_precision, quote_asset_precision, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (symbol) DO UPDATE SET
+                    base_asset              = excluded.base_asset,
+                    quote_asset             = excluded.quote_asset,
+                    status                  = excluded.status,
+                    is_spot_trading_allowed = excluded.is_spot_trading_allowed,
+                    is_margin_trading_allowed = excluded.is_margin_trading_allowed,
+                    base_asset_precision    = excluded.base_asset_precision,
+                    quote_asset_precision   = excluded.quote_asset_precision,
+                    updated_at              = excluded.updated_at;
+                """,
+                (
+                    symbol,
+                    base_asset,
+                    quote_asset,
+                    status,
+                    int(is_spot_trading_allowed),
+                    int(is_margin_trading_allowed),
+                    base_asset_precision,
+                    quote_asset_precision,
+                    updated_at,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseIntegrityError(
+                f"Integrity error inserting symbol '{symbol}': {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to insert symbol '{symbol}': {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Repository: symbol_status_events
+    # ------------------------------------------------------------------
+
+    def insert_symbol_status_event(
+        self,
+        symbol: str,
+        status: str,
+        is_spot_trading_allowed: bool,
+        effective_at: int,
+        raw_response_id: Optional[int] = None,
+    ) -> int:
+        """Append a symbol status transition event.
+
+        Args:
+            symbol: Trading pair symbol. Must exist in ``symbols`` table.
+            status: New status value.
+            is_spot_trading_allowed: New spot-trading permission.
+            effective_at: UTC epoch milliseconds when the transition was observed.
+            raw_response_id: Optional FK to ``raw_api_responses.id``.
+
+        Returns:
+            The rowid of the inserted event.
+
+        Raises:
+            DatabaseIntegrityError: If the referenced symbol does not exist.
+            DatabaseError: If the insert fails.
+        """
+        conn = self.connection
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO symbol_status_events
+                    (symbol, status, is_spot_trading_allowed, effective_at, raw_response_id)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (
+                    symbol,
+                    status,
+                    int(is_spot_trading_allowed),
+                    effective_at,
+                    raw_response_id,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseIntegrityError(
+                f"Integrity error inserting status event for '{symbol}': {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to insert status event for '{symbol}': {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Repository: raw_api_responses
+    # ------------------------------------------------------------------
+
+    def insert_raw_api_response(
+        self,
+        endpoint: str,
+        response_json: str,
+        fetched_at: int,
+        params_json: Optional[str] = None,
+        ingestion_run_id: Optional[int] = None,
+    ) -> int:
+        """Store an immutable raw API response with SHA-256 content hash.
+
+        Args:
+            endpoint: API endpoint path (e.g. '/api/v3/exchangeInfo').
+            response_json: The full raw JSON response string.
+            fetched_at: UTC epoch milliseconds when the response was fetched.
+            params_json: Optional JSON-encoded request parameters.
+            ingestion_run_id: Optional FK to ``ingestion_runs.id``.
+
+        Returns:
+            The rowid of the inserted record.
+
+        Raises:
+            DatabaseError: If the insert fails.
+        """
+        content_hash = hashlib.sha256(response_json.encode("utf-8")).hexdigest()
+        conn = self.connection
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO raw_api_responses
+                    (endpoint, params_json, response_json, content_hash,
+                     ingestion_run_id, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    endpoint,
+                    params_json,
+                    response_json,
+                    content_hash,
+                    ingestion_run_id,
+                    fetched_at,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseIntegrityError(
+                f"Integrity error inserting raw response for '{endpoint}': {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to insert raw response for '{endpoint}': {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Repository: ingestion_runs
+    # ------------------------------------------------------------------
+
+    def create_ingestion_run(
+        self,
+        run_type: str,
+        started_at: int,
+    ) -> int:
+        """Create a new ingestion run record.
+
+        Args:
+            run_type: Type descriptor (e.g. 'kline_backfill', 'exchange_info_sync').
+            started_at: UTC epoch milliseconds when the run started.
+
+        Returns:
+            The rowid of the created run.
+
+        Raises:
+            DatabaseError: If the insert fails.
+        """
+        conn = self.connection
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO ingestion_runs (run_type, status, started_at)
+                VALUES (?, 'started', ?);
+                """,
+                (run_type, started_at),
+            )
+            conn.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to create ingestion run: {exc}"
+            ) from exc
+
+    def update_ingestion_run(
+        self,
+        run_id: int,
+        status: str,
+        completed_at: Optional[int] = None,
+        records_fetched: Optional[int] = None,
+        records_stored: Optional[int] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Update an existing ingestion run record.
+
+        Args:
+            run_id: The rowid of the ingestion run to update.
+            status: New status (e.g. 'completed', 'failed').
+            completed_at: Optional UTC epoch ms completion timestamp.
+            records_fetched: Optional count of records fetched.
+            records_stored: Optional count of records stored.
+            error_message: Optional error message on failure.
+
+        Raises:
+            DatabaseError: If the update fails.
+        """
+        conn = self.connection
+        # Build dynamic SET clause for only the provided fields
+        fields: List[str] = ["status = ?"]
+        params: List[Any] = [status]
+
+        if completed_at is not None:
+            fields.append("completed_at = ?")
+            params.append(completed_at)
+        if records_fetched is not None:
+            fields.append("records_fetched = ?")
+            params.append(records_fetched)
+        if records_stored is not None:
+            fields.append("records_stored = ?")
+            params.append(records_stored)
+        if error_message is not None:
+            fields.append("error_message = ?")
+            params.append(error_message)
+
+        params.append(run_id)
+
+        try:
+            conn.execute(
+                f"UPDATE ingestion_runs SET {', '.join(fields)} WHERE id = ?;",
+                params,
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to update ingestion run {run_id}: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Repository: klines
+    # ------------------------------------------------------------------
+
+    def insert_kline(
+        self,
+        symbol: str,
+        interval: str,
+        open_time: int,
+        open_price: Decimal,
+        high_price: Decimal,
+        low_price: Decimal,
+        close_price: Decimal,
+        volume: Decimal,
+        close_time: int,
+        quote_asset_volume: Decimal,
+        number_of_trades: int,
+        taker_buy_base_volume: Decimal,
+        taker_buy_quote_volume: Decimal,
+        raw_response_id: Optional[int] = None,
+    ) -> None:
+        """Insert a single kline row. Raises on PK conflict.
+
+        Financial Decimal values are stored as TEXT via ``str()``.
+
+        Raises:
+            DatabaseIntegrityError: If the kline already exists (PK conflict)
+                                    or a FK constraint is violated.
+            DatabaseError: If the insert fails.
+        """
+        conn = self.connection
+        try:
+            conn.execute(
+                """
+                INSERT INTO klines
+                    (symbol, interval, open_time, open_price, high_price, low_price,
+                     close_price, volume, close_time, quote_asset_volume,
+                     number_of_trades, taker_buy_base_volume, taker_buy_quote_volume,
+                     raw_response_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    symbol, interval, open_time,
+                    str(open_price), str(high_price), str(low_price),
+                    str(close_price), str(volume), close_time,
+                    str(quote_asset_volume), number_of_trades,
+                    str(taker_buy_base_volume), str(taker_buy_quote_volume),
+                    raw_response_id,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseIntegrityError(
+                f"Integrity error inserting kline ({symbol}, {interval}, {open_time}): {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to insert kline ({symbol}, {interval}, {open_time}): {exc}"
+            ) from exc
+
+    def upsert_kline(
+        self,
+        symbol: str,
+        interval: str,
+        open_time: int,
+        open_price: Decimal,
+        high_price: Decimal,
+        low_price: Decimal,
+        close_price: Decimal,
+        volume: Decimal,
+        close_time: int,
+        quote_asset_volume: Decimal,
+        number_of_trades: int,
+        taker_buy_base_volume: Decimal,
+        taker_buy_quote_volume: Decimal,
+        raw_response_id: Optional[int] = None,
+    ) -> None:
+        """Insert or update a kline row via ON CONFLICT DO UPDATE.
+
+        Used for forming candles that may receive updated data, and for
+        deliberate re-ingestion of finalized candles.
+
+        Raises:
+            DatabaseIntegrityError: If a FK constraint is violated.
+            DatabaseError: If the upsert fails.
+        """
+        conn = self.connection
+        try:
+            conn.execute(
+                """
+                INSERT INTO klines
+                    (symbol, interval, open_time, open_price, high_price, low_price,
+                     close_price, volume, close_time, quote_asset_volume,
+                     number_of_trades, taker_buy_base_volume, taker_buy_quote_volume,
+                     raw_response_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (symbol, interval, open_time) DO UPDATE SET
+                    open_price              = excluded.open_price,
+                    high_price              = excluded.high_price,
+                    low_price               = excluded.low_price,
+                    close_price             = excluded.close_price,
+                    volume                  = excluded.volume,
+                    close_time              = excluded.close_time,
+                    quote_asset_volume      = excluded.quote_asset_volume,
+                    number_of_trades        = excluded.number_of_trades,
+                    taker_buy_base_volume   = excluded.taker_buy_base_volume,
+                    taker_buy_quote_volume  = excluded.taker_buy_quote_volume,
+                    raw_response_id         = excluded.raw_response_id;
+                """,
+                (
+                    symbol, interval, open_time,
+                    str(open_price), str(high_price), str(low_price),
+                    str(close_price), str(volume), close_time,
+                    str(quote_asset_volume), number_of_trades,
+                    str(taker_buy_base_volume), str(taker_buy_quote_volume),
+                    raw_response_id,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseIntegrityError(
+                f"Integrity error upserting kline ({symbol}, {interval}, {open_time}): {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to upsert kline ({symbol}, {interval}, {open_time}): {exc}"
+            ) from exc
+
+    def query_klines_range(
+        self,
+        symbol: str,
+        interval: str,
+        start_time: int,
+        end_time: int,
+    ) -> List[Dict[str, Any]]:
+        """Query klines within a time range, ordered by open_time ASC.
+
+        Args:
+            symbol: Trading pair symbol.
+            interval: Kline interval (e.g. '1h').
+            start_time: Inclusive start UTC epoch ms.
+            end_time: Exclusive end UTC epoch ms.
+
+        Returns:
+            List of kline dicts with Decimal financial values and int timestamps.
+
+        Raises:
+            DatabaseError: If the query fails.
+        """
+        conn = self.connection
+        try:
+            rows = conn.execute(
+                """
+                SELECT symbol, interval, open_time, open_price, high_price,
+                       low_price, close_price, volume, close_time,
+                       quote_asset_volume, number_of_trades,
+                       taker_buy_base_volume, taker_buy_quote_volume,
+                       raw_response_id
+                FROM klines
+                WHERE symbol = ? AND interval = ?
+                  AND open_time >= ? AND open_time < ?
+                ORDER BY open_time ASC;
+                """,
+                (symbol, interval, start_time, end_time),
+            ).fetchall()
+            return [self._row_to_kline_dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query klines range for {symbol}/{interval}: {exc}"
+            ) from exc
+
+    def query_klines_latest(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Query the latest N klines, ordered by open_time DESC.
+
+        Args:
+            symbol: Trading pair symbol.
+            interval: Kline interval (e.g. '1h').
+            limit: Maximum number of klines to return.
+
+        Returns:
+            List of kline dicts ordered by open_time DESC.
+
+        Raises:
+            DatabaseError: If the query fails.
+        """
+        conn = self.connection
+        try:
+            rows = conn.execute(
+                """
+                SELECT symbol, interval, open_time, open_price, high_price,
+                       low_price, close_price, volume, close_time,
+                       quote_asset_volume, number_of_trades,
+                       taker_buy_base_volume, taker_buy_quote_volume,
+                       raw_response_id
+                FROM klines
+                WHERE symbol = ? AND interval = ?
+                ORDER BY open_time DESC
+                LIMIT ?;
+                """,
+                (symbol, interval, limit),
+            ).fetchall()
+            return [self._row_to_kline_dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query latest klines for {symbol}/{interval}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _row_to_kline_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        """Convert a sqlite3.Row from the klines table to a dict with Decimal values."""
+        return {
+            "symbol": row["symbol"],
+            "interval": row["interval"],
+            "open_time": row["open_time"],
+            "open_price": Decimal(row["open_price"]),
+            "high_price": Decimal(row["high_price"]),
+            "low_price": Decimal(row["low_price"]),
+            "close_price": Decimal(row["close_price"]),
+            "volume": Decimal(row["volume"]),
+            "close_time": row["close_time"],
+            "quote_asset_volume": Decimal(row["quote_asset_volume"]),
+            "number_of_trades": row["number_of_trades"],
+            "taker_buy_base_volume": Decimal(row["taker_buy_base_volume"]),
+            "taker_buy_quote_volume": Decimal(row["taker_buy_quote_volume"]),
+            "raw_response_id": row["raw_response_id"],
+        }
+
+    # ------------------------------------------------------------------
+    # Repository: ticker_snapshots
+    # ------------------------------------------------------------------
+
+    def insert_ticker_snapshot(
+        self,
+        symbol: str,
+        price: Decimal,
+        snapshot_at: int,
+        raw_response_id: Optional[int] = None,
+    ) -> int:
+        """Store a point-in-time price snapshot.
+
+        Args:
+            symbol: Trading pair symbol. Must exist in ``symbols`` table.
+            price: Price as Decimal, stored as TEXT.
+            snapshot_at: UTC epoch milliseconds.
+            raw_response_id: Optional FK to ``raw_api_responses.id``.
+
+        Returns:
+            The rowid of the inserted snapshot.
+
+        Raises:
+            DatabaseIntegrityError: If a FK constraint is violated.
+            DatabaseError: If the insert fails.
+        """
+        conn = self.connection
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO ticker_snapshots
+                    (symbol, price, snapshot_at, raw_response_id)
+                VALUES (?, ?, ?, ?);
+                """,
+                (symbol, str(price), snapshot_at, raw_response_id),
+            )
+            conn.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseIntegrityError(
+                f"Integrity error inserting ticker snapshot for '{symbol}': {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to insert ticker snapshot for '{symbol}': {exc}"
+            ) from exc
+
+    def query_ticker_snapshots(
+        self,
+        symbol: str,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Query ticker snapshots for a symbol, newest first.
+
+        Args:
+            symbol: Trading pair symbol.
+            limit: Maximum number of snapshots to return.
+
+        Returns:
+            List of snapshot dicts with Decimal price and int timestamp.
+
+        Raises:
+            DatabaseError: If the query fails.
+        """
+        conn = self.connection
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, price, snapshot_at, raw_response_id, created_at
+                FROM ticker_snapshots
+                WHERE symbol = ?
+                ORDER BY snapshot_at DESC
+                LIMIT ?;
+                """,
+                (symbol, limit),
+            ).fetchall()
+            return [
+                {
+                    "id": row["id"],
+                    "symbol": row["symbol"],
+                    "price": Decimal(row["price"]),
+                    "snapshot_at": row["snapshot_at"],
+                    "raw_response_id": row["raw_response_id"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query ticker snapshots for '{symbol}': {exc}"
+            ) from exc

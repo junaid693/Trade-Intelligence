@@ -10,6 +10,8 @@ from trade_intelligence.binance.exceptions import (
     BinanceResponseError,
     BinanceTimeoutError,
 )
+from trade_intelligence.db.database import Database
+from trade_intelligence.db.exceptions import DatabaseError, DatabaseIntegrityError
 
 __version__ = "0.1.0"
 
@@ -22,4 +24,7 @@ __all__ = [
     "BinanceHttpError",
     "BinanceApiError",
     "BinanceResponseError",
+    "Database",
+    "DatabaseError",
+    "DatabaseIntegrityError",
 ]
