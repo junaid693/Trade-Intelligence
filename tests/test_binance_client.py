@@ -334,8 +334,10 @@ class TestBinanceRestClient(unittest.TestCase):
             text="invalid json string",
         )
 
-        with self.assertRaises(BinanceResponseError):
+        with self.assertRaises(BinanceResponseError) as ctx:
             self.client.get_server_time()
+
+        self.assertIsNotNone(ctx.exception.__cause__)
 
     @patch.object(requests.Session, "request")
     def test_malformed_model_data_handling(self, mock_request):

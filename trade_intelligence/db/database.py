@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from trade_intelligence.binance.enums import KlineInterval
 from trade_intelligence.db.exceptions import (
     DatabaseError,
     DatabaseInitError,
@@ -28,6 +29,63 @@ DEFAULT_PRAGMAS: Dict[str, Any] = {
     "busy_timeout": 5000,  # 5 seconds
     "foreign_keys": 1,     # Always enforced
 }
+
+
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    """Attempt rollback on connection without masking the original exception."""
+    try:
+        conn.rollback()
+    except sqlite3.Error:
+        pass
+
+
+def _to_decimal_str(val: Any, name: str = "value") -> str:
+    """Validate that val is a finite Decimal and convert to string.
+
+    Guarantees that float values or non-finite values (NaN, Infinity) cannot
+    contaminate the database.
+    """
+    if not isinstance(val, Decimal):
+        raise TypeError(
+            f"{name} must be a Decimal instance, got {type(val).__name__}: {val!r}"
+        )
+    if not val.is_finite():
+        raise ValueError(f"{name} must be a finite Decimal, got: {val}")
+    return str(val)
+
+
+def _validate_timestamp(ts: Any, name: str = "timestamp") -> int:
+    """Validate that ts is a non-negative integer epoch millisecond timestamp."""
+    if isinstance(ts, bool) or not isinstance(ts, int):
+        raise TypeError(
+            f"{name} must be an integer epoch millisecond timestamp, got {type(ts).__name__}: {ts!r}"
+        )
+    if ts < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got: {ts}")
+    return ts
+
+
+def _validate_symbol(symbol: str) -> str:
+    """Validate and normalize trading pair symbol to stripped uppercase."""
+    if not isinstance(symbol, str):
+        raise TypeError(
+            f"Symbol must be a string, got {type(symbol).__name__}: {symbol!r}"
+        )
+    cleaned = symbol.strip().upper()
+    if not cleaned:
+        raise ValueError("Symbol cannot be empty.")
+    return cleaned
+
+
+def _validate_limit(limit: int, name: str = "limit") -> int:
+    """Validate query limit parameter."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError(
+            f"{name} must be an integer, got {type(limit).__name__}: {limit!r}"
+        )
+    if limit < 1:
+        raise ValueError(f"Invalid {name}: {limit}. Limit must be a positive integer.")
+    return limit
 
 
 class Database:
@@ -125,6 +183,8 @@ class Database:
         """Apply configured PRAGMA settings to the active connection."""
         conn = self.connection
         for pragma, value in self._pragmas.items():
+            if not pragma.replace("_", "").isalnum():
+                raise DatabaseError(f"Invalid PRAGMA name: '{pragma}'")
             conn.execute(f"PRAGMA {pragma} = {value};")
 
     # ------------------------------------------------------------------
@@ -137,20 +197,28 @@ class Database:
         Safe to call multiple times (uses CREATE TABLE IF NOT EXISTS).
 
         Raises:
-            DatabaseInitError: If schema creation fails.
+            DatabaseInitError: If schema creation fails or schema version is unsupported.
         """
         conn = self.connection
         try:
+            existing = self.get_schema_version()
+            if existing is not None and existing > SCHEMA_VERSION:
+                raise DatabaseInitError(
+                    f"Database schema version {existing} is newer than supported version {SCHEMA_VERSION}."
+                )
             conn.executescript(SCHEMA_SQL)
             # Record schema version if not already recorded
-            existing = self.get_schema_version()
             if existing is None:
                 conn.execute(
                     "INSERT INTO schema_version (version) VALUES (?);",
                     (SCHEMA_VERSION,),
                 )
                 conn.commit()
+        except DatabaseInitError:
+            _rollback_quietly(conn)
+            raise
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseInitError(
                 f"Failed to initialize database schema: {exc}"
             ) from exc
@@ -215,8 +283,11 @@ class Database:
             updated_at: UTC epoch milliseconds when this state was observed.
 
         Raises:
+            DatabaseIntegrityError: If a constraint violation occurs.
             DatabaseError: If the insert fails.
         """
+        sym = _validate_symbol(symbol)
+        ts = _validate_timestamp(updated_at, "updated_at")
         conn = self.connection
         try:
             conn.execute(
@@ -237,7 +308,7 @@ class Database:
                     updated_at              = excluded.updated_at;
                 """,
                 (
-                    symbol,
+                    sym,
                     base_asset,
                     quote_asset,
                     status,
@@ -245,17 +316,19 @@ class Database:
                     int(is_margin_trading_allowed),
                     base_asset_precision,
                     quote_asset_precision,
-                    updated_at,
+                    ts,
                 ),
             )
             conn.commit()
         except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
             raise DatabaseIntegrityError(
-                f"Integrity error inserting symbol '{symbol}': {exc}"
+                f"Integrity error inserting symbol '{sym}': {exc}"
             ) from exc
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
-                f"Failed to insert symbol '{symbol}': {exc}"
+                f"Failed to insert symbol '{sym}': {exc}"
             ) from exc
 
     # ------------------------------------------------------------------
@@ -286,6 +359,8 @@ class Database:
             DatabaseIntegrityError: If the referenced symbol does not exist.
             DatabaseError: If the insert fails.
         """
+        sym = _validate_symbol(symbol)
+        ts = _validate_timestamp(effective_at, "effective_at")
         conn = self.connection
         try:
             cursor = conn.execute(
@@ -295,22 +370,24 @@ class Database:
                 VALUES (?, ?, ?, ?, ?);
                 """,
                 (
-                    symbol,
+                    sym,
                     status,
                     int(is_spot_trading_allowed),
-                    effective_at,
+                    ts,
                     raw_response_id,
                 ),
             )
             conn.commit()
             return cursor.lastrowid  # type: ignore[return-value]
         except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
             raise DatabaseIntegrityError(
-                f"Integrity error inserting status event for '{symbol}': {exc}"
+                f"Integrity error inserting status event for '{sym}': {exc}"
             ) from exc
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
-                f"Failed to insert status event for '{symbol}': {exc}"
+                f"Failed to insert status event for '{sym}': {exc}"
             ) from exc
 
     # ------------------------------------------------------------------
@@ -338,8 +415,10 @@ class Database:
             The rowid of the inserted record.
 
         Raises:
+            DatabaseIntegrityError: If foreign key constraint is violated.
             DatabaseError: If the insert fails.
         """
+        ts = _validate_timestamp(fetched_at, "fetched_at")
         content_hash = hashlib.sha256(response_json.encode("utf-8")).hexdigest()
         conn = self.connection
         try:
@@ -356,16 +435,18 @@ class Database:
                     response_json,
                     content_hash,
                     ingestion_run_id,
-                    fetched_at,
+                    ts,
                 ),
             )
             conn.commit()
             return cursor.lastrowid  # type: ignore[return-value]
         except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
             raise DatabaseIntegrityError(
                 f"Integrity error inserting raw response for '{endpoint}': {exc}"
             ) from exc
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
                 f"Failed to insert raw response for '{endpoint}': {exc}"
             ) from exc
@@ -391,6 +472,7 @@ class Database:
         Raises:
             DatabaseError: If the insert fails.
         """
+        ts = _validate_timestamp(started_at, "started_at")
         conn = self.connection
         try:
             cursor = conn.execute(
@@ -398,11 +480,17 @@ class Database:
                 INSERT INTO ingestion_runs (run_type, status, started_at)
                 VALUES (?, 'started', ?);
                 """,
-                (run_type, started_at),
+                (run_type, ts),
             )
             conn.commit()
             return cursor.lastrowid  # type: ignore[return-value]
+        except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
+            raise DatabaseIntegrityError(
+                f"Integrity error creating ingestion run: {exc}"
+            ) from exc
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
                 f"Failed to create ingestion run: {exc}"
             ) from exc
@@ -427,10 +515,11 @@ class Database:
             error_message: Optional error message on failure.
 
         Raises:
-            DatabaseError: If the update fails.
+            DatabaseError: If the update fails or the run_id does not exist.
         """
+        if completed_at is not None:
+            _validate_timestamp(completed_at, "completed_at")
         conn = self.connection
-        # Build dynamic SET clause for only the provided fields
         fields: List[str] = ["status = ?"]
         params: List[Any] = [status]
 
@@ -450,12 +539,18 @@ class Database:
         params.append(run_id)
 
         try:
-            conn.execute(
+            cursor = conn.execute(
                 f"UPDATE ingestion_runs SET {', '.join(fields)} WHERE id = ?;",
                 params,
             )
+            if cursor.rowcount == 0:
+                raise DatabaseError(f"Ingestion run with id {run_id} not found.")
             conn.commit()
+        except DatabaseError:
+            _rollback_quietly(conn)
+            raise
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
                 f"Failed to update ingestion run {run_id}: {exc}"
             ) from exc
@@ -467,7 +562,7 @@ class Database:
     def insert_kline(
         self,
         symbol: str,
-        interval: str,
+        interval: Union[str, KlineInterval],
         open_time: int,
         open_price: Decimal,
         high_price: Decimal,
@@ -483,13 +578,26 @@ class Database:
     ) -> None:
         """Insert a single kline row. Raises on PK conflict.
 
-        Financial Decimal values are stored as TEXT via ``str()``.
+        Financial Decimal values are validated as finite Decimals and stored as TEXT.
 
         Raises:
             DatabaseIntegrityError: If the kline already exists (PK conflict)
                                     or a FK constraint is violated.
             DatabaseError: If the insert fails.
         """
+        sym = _validate_symbol(symbol)
+        iv = KlineInterval.from_value(interval).value
+        ot = _validate_timestamp(open_time, "open_time")
+        ct = _validate_timestamp(close_time, "close_time")
+        op = _to_decimal_str(open_price, "open_price")
+        hp = _to_decimal_str(high_price, "high_price")
+        lp = _to_decimal_str(low_price, "low_price")
+        cp = _to_decimal_str(close_price, "close_price")
+        vol = _to_decimal_str(volume, "volume")
+        qav = _to_decimal_str(quote_asset_volume, "quote_asset_volume")
+        tbv = _to_decimal_str(taker_buy_base_volume, "taker_buy_base_volume")
+        tqv = _to_decimal_str(taker_buy_quote_volume, "taker_buy_quote_volume")
+
         conn = self.connection
         try:
             conn.execute(
@@ -502,28 +610,28 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
-                    symbol, interval, open_time,
-                    str(open_price), str(high_price), str(low_price),
-                    str(close_price), str(volume), close_time,
-                    str(quote_asset_volume), number_of_trades,
-                    str(taker_buy_base_volume), str(taker_buy_quote_volume),
+                    sym, iv, ot,
+                    op, hp, lp, cp, vol, ct,
+                    qav, number_of_trades, tbv, tqv,
                     raw_response_id,
                 ),
             )
             conn.commit()
         except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
             raise DatabaseIntegrityError(
-                f"Integrity error inserting kline ({symbol}, {interval}, {open_time}): {exc}"
+                f"Integrity error inserting kline ({sym}, {iv}, {ot}): {exc}"
             ) from exc
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
-                f"Failed to insert kline ({symbol}, {interval}, {open_time}): {exc}"
+                f"Failed to insert kline ({sym}, {iv}, {ot}): {exc}"
             ) from exc
 
     def upsert_kline(
         self,
         symbol: str,
-        interval: str,
+        interval: Union[str, KlineInterval],
         open_time: int,
         open_price: Decimal,
         high_price: Decimal,
@@ -546,6 +654,19 @@ class Database:
             DatabaseIntegrityError: If a FK constraint is violated.
             DatabaseError: If the upsert fails.
         """
+        sym = _validate_symbol(symbol)
+        iv = KlineInterval.from_value(interval).value
+        ot = _validate_timestamp(open_time, "open_time")
+        ct = _validate_timestamp(close_time, "close_time")
+        op = _to_decimal_str(open_price, "open_price")
+        hp = _to_decimal_str(high_price, "high_price")
+        lp = _to_decimal_str(low_price, "low_price")
+        cp = _to_decimal_str(close_price, "close_price")
+        vol = _to_decimal_str(volume, "volume")
+        qav = _to_decimal_str(quote_asset_volume, "quote_asset_volume")
+        tbv = _to_decimal_str(taker_buy_base_volume, "taker_buy_base_volume")
+        tqv = _to_decimal_str(taker_buy_quote_volume, "taker_buy_quote_volume")
+
         conn = self.connection
         try:
             conn.execute(
@@ -570,28 +691,28 @@ class Database:
                     raw_response_id         = excluded.raw_response_id;
                 """,
                 (
-                    symbol, interval, open_time,
-                    str(open_price), str(high_price), str(low_price),
-                    str(close_price), str(volume), close_time,
-                    str(quote_asset_volume), number_of_trades,
-                    str(taker_buy_base_volume), str(taker_buy_quote_volume),
+                    sym, iv, ot,
+                    op, hp, lp, cp, vol, ct,
+                    qav, number_of_trades, tbv, tqv,
                     raw_response_id,
                 ),
             )
             conn.commit()
         except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
             raise DatabaseIntegrityError(
-                f"Integrity error upserting kline ({symbol}, {interval}, {open_time}): {exc}"
+                f"Integrity error upserting kline ({sym}, {iv}, {ot}): {exc}"
             ) from exc
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
-                f"Failed to upsert kline ({symbol}, {interval}, {open_time}): {exc}"
+                f"Failed to upsert kline ({sym}, {iv}, {ot}): {exc}"
             ) from exc
 
     def query_klines_range(
         self,
         symbol: str,
-        interval: str,
+        interval: Union[str, KlineInterval],
         start_time: int,
         end_time: int,
     ) -> List[Dict[str, Any]]:
@@ -599,7 +720,7 @@ class Database:
 
         Args:
             symbol: Trading pair symbol.
-            interval: Kline interval (e.g. '1h').
+            interval: Kline interval (e.g. '1h' or KlineInterval enum).
             start_time: Inclusive start UTC epoch ms.
             end_time: Exclusive end UTC epoch ms.
 
@@ -609,6 +730,10 @@ class Database:
         Raises:
             DatabaseError: If the query fails.
         """
+        sym = _validate_symbol(symbol)
+        iv = KlineInterval.from_value(interval).value
+        st = _validate_timestamp(start_time, "start_time")
+        et = _validate_timestamp(end_time, "end_time")
         conn = self.connection
         try:
             rows = conn.execute(
@@ -623,33 +748,37 @@ class Database:
                   AND open_time >= ? AND open_time < ?
                 ORDER BY open_time ASC;
                 """,
-                (symbol, interval, start_time, end_time),
+                (sym, iv, st, et),
             ).fetchall()
             return [self._row_to_kline_dict(row) for row in rows]
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Failed to query klines range for {symbol}/{interval}: {exc}"
+                f"Failed to query klines range for {sym}/{iv}: {exc}"
             ) from exc
 
     def query_klines_latest(
         self,
         symbol: str,
-        interval: str,
+        interval: Union[str, KlineInterval],
         limit: int,
     ) -> List[Dict[str, Any]]:
         """Query the latest N klines, ordered by open_time DESC.
 
         Args:
             symbol: Trading pair symbol.
-            interval: Kline interval (e.g. '1h').
-            limit: Maximum number of klines to return.
+            interval: Kline interval (e.g. '1h' or KlineInterval enum).
+            limit: Maximum number of klines to return (positive integer).
 
         Returns:
             List of kline dicts ordered by open_time DESC.
 
         Raises:
+            ValueError: If limit < 1.
             DatabaseError: If the query fails.
         """
+        sym = _validate_symbol(symbol)
+        iv = KlineInterval.from_value(interval).value
+        lim = _validate_limit(limit)
         conn = self.connection
         try:
             rows = conn.execute(
@@ -664,12 +793,12 @@ class Database:
                 ORDER BY open_time DESC
                 LIMIT ?;
                 """,
-                (symbol, interval, limit),
+                (sym, iv, lim),
             ).fetchall()
             return [self._row_to_kline_dict(row) for row in rows]
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Failed to query latest klines for {symbol}/{interval}: {exc}"
+                f"Failed to query latest klines for {sym}/{iv}: {exc}"
             ) from exc
 
     @staticmethod
@@ -707,7 +836,7 @@ class Database:
 
         Args:
             symbol: Trading pair symbol. Must exist in ``symbols`` table.
-            price: Price as Decimal, stored as TEXT.
+            price: Price as finite Decimal, stored as TEXT.
             snapshot_at: UTC epoch milliseconds.
             raw_response_id: Optional FK to ``raw_api_responses.id``.
 
@@ -718,6 +847,9 @@ class Database:
             DatabaseIntegrityError: If a FK constraint is violated.
             DatabaseError: If the insert fails.
         """
+        sym = _validate_symbol(symbol)
+        p = _to_decimal_str(price, "price")
+        ts = _validate_timestamp(snapshot_at, "snapshot_at")
         conn = self.connection
         try:
             cursor = conn.execute(
@@ -726,17 +858,19 @@ class Database:
                     (symbol, price, snapshot_at, raw_response_id)
                 VALUES (?, ?, ?, ?);
                 """,
-                (symbol, str(price), snapshot_at, raw_response_id),
+                (sym, p, ts, raw_response_id),
             )
             conn.commit()
             return cursor.lastrowid  # type: ignore[return-value]
         except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
             raise DatabaseIntegrityError(
-                f"Integrity error inserting ticker snapshot for '{symbol}': {exc}"
+                f"Integrity error inserting ticker snapshot for '{sym}': {exc}"
             ) from exc
         except sqlite3.Error as exc:
+            _rollback_quietly(conn)
             raise DatabaseError(
-                f"Failed to insert ticker snapshot for '{symbol}': {exc}"
+                f"Failed to insert ticker snapshot for '{sym}': {exc}"
             ) from exc
 
     def query_ticker_snapshots(
@@ -748,14 +882,17 @@ class Database:
 
         Args:
             symbol: Trading pair symbol.
-            limit: Maximum number of snapshots to return.
+            limit: Maximum number of snapshots to return (positive integer).
 
         Returns:
             List of snapshot dicts with Decimal price and int timestamp.
 
         Raises:
+            ValueError: If limit < 1.
             DatabaseError: If the query fails.
         """
+        sym = _validate_symbol(symbol)
+        lim = _validate_limit(limit)
         conn = self.connection
         try:
             rows = conn.execute(
@@ -766,7 +903,7 @@ class Database:
                 ORDER BY snapshot_at DESC
                 LIMIT ?;
                 """,
-                (symbol, limit),
+                (sym, lim),
             ).fetchall()
             return [
                 {
@@ -781,5 +918,5 @@ class Database:
             ]
         except sqlite3.Error as exc:
             raise DatabaseError(
-                f"Failed to query ticker snapshots for '{symbol}': {exc}"
+                f"Failed to query ticker snapshots for '{sym}': {exc}"
             ) from exc

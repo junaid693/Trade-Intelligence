@@ -109,17 +109,17 @@ class BinanceRestClient:
         # Attempt to parse JSON body
         try:
             data = response.json()
-        except Exception:
+        except Exception as exc:
             # Response was not JSON
             if not response.ok:
                 raise BinanceHttpError(
                     status_code=response.status_code,
                     message=response.text or "Unknown HTTP error",
                     raw_response=response.text,
-                )
+                ) from exc
             raise BinanceResponseError(
                 f"Failed to parse JSON response from {endpoint}: {response.text[:200]}"
-            )
+            ) from exc
 
         # Check for Binance API errors (typically with HTTP >= 400 or containing "code" and "msg")
         if not response.ok or (isinstance(data, dict) and "code" in data and "msg" in data and data["code"] != 0):

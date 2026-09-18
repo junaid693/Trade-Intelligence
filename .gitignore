@@ -223,6 +223,12 @@ __marimo__/
 *.sqlite3
 *.db-journal
 *.sqlite3-journal
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Local Environment / Credentials
 .env

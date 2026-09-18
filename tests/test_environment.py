@@ -21,6 +21,12 @@ class TestEnvironment(unittest.TestCase):
         """Ensure trade_intelligence package is importable."""
         self.assertEqual(trade_intelligence.__version__, "0.1.0")
 
+    def test_database_exceptions_exported(self):
+        """Ensure all database exception classes are exported at package root."""
+        self.assertTrue(hasattr(trade_intelligence, "DatabaseError"))
+        self.assertTrue(hasattr(trade_intelligence, "DatabaseInitError"))
+        self.assertTrue(hasattr(trade_intelligence, "DatabaseIntegrityError"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
+from trade_intelligence.binance.enums import KlineInterval
 from trade_intelligence.db.database import Database, DEFAULT_PRAGMAS
 from trade_intelligence.db.exceptions import (
     DatabaseError,
@@ -971,6 +972,239 @@ class TestExplainQueryPlan(unittest.TestCase):
                 self.assertIn("PRIMARY KEY", plan_desc_text.upper())
             finally:
                 db.close()
+
+
+class TestDatabaseHardeningAndIntegrity(unittest.TestCase):
+    """Regression and hardening tests for data integrity and error handling."""
+
+    def test_rollback_on_integrity_error_cleans_transaction(self):
+        """Verify that connection is not left in a dirty transaction after error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            conn = db.connection
+            self.assertFalse(conn.in_transaction)
+
+            with self.assertRaises(DatabaseIntegrityError):
+                db.insert_symbol_status_event("NONEXISTENT", "TRADING", True, 1000)
+
+            # Transaction must be cleanly rolled back
+            self.assertFalse(conn.in_transaction)
+            db.close()
+
+    def test_pragma_sql_injection_protection(self):
+        """Verify invalid PRAGMA names containing SQL injection are rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(
+                os.path.join(tmp, "test.db"),
+                pragmas={"invalid; DROP TABLE klines; --": 1},
+            )
+            with self.assertRaises(DatabaseError) as ctx:
+                db.connect()
+            self.assertIn("Invalid PRAGMA name", str(ctx.exception))
+            db.close()
+
+    def test_unsupported_future_schema_version_rejected(self):
+        """Verify opening a database with a future schema version raises DatabaseInitError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "future.db")
+            db = Database(db_path)
+            db.connect()
+            db.initialize()
+            # Artificially insert a future schema version
+            conn = db.connection
+            conn.execute("INSERT INTO schema_version (version) VALUES (99);")
+            conn.commit()
+            db.close()
+
+            # Reopening and initializing should fail
+            db2 = Database(db_path)
+            db2.connect()
+            with self.assertRaises(DatabaseInitError) as ctx:
+                db2.initialize()
+            self.assertIn("newer than supported version", str(ctx.exception))
+            db2.close()
+
+    def test_update_nonexistent_ingestion_run_raises(self):
+        """Verify updating a non-existent ingestion run raises DatabaseError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            with self.assertRaises(DatabaseError) as ctx:
+                db.update_ingestion_run(run_id=99999, status="failed")
+            self.assertIn("not found", str(ctx.exception))
+            db.close()
+
+    def test_decimal_type_safety_rejects_float_and_nan(self):
+        """Verify float, NaN, and Infinity values are rejected to prevent contamination."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db)
+
+            # Float should raise TypeError
+            with self.assertRaises(TypeError):
+                db.insert_kline(
+                    symbol="BTCUSDT",
+                    interval="1h",
+                    open_time=1700000000000,
+                    open_price=50000.0,  # float!
+                    high_price=Decimal("51000"),
+                    low_price=Decimal("49000"),
+                    close_price=Decimal("50500"),
+                    volume=Decimal("100"),
+                    close_time=1700003599999,
+                    quote_asset_volume=Decimal("5000000"),
+                    number_of_trades=1000,
+                    taker_buy_base_volume=Decimal("50"),
+                    taker_buy_quote_volume=Decimal("2500000"),
+                )
+
+            # NaN should raise ValueError
+            with self.assertRaises(ValueError):
+                db.insert_ticker_snapshot("BTCUSDT", price=Decimal("NaN"), snapshot_at=1000)
+
+            # Infinity should raise ValueError
+            with self.assertRaises(ValueError):
+                db.insert_ticker_snapshot("BTCUSDT", price=Decimal("Infinity"), snapshot_at=1000)
+
+            # Float in ticker snapshot should raise TypeError
+            with self.assertRaises(TypeError):
+                db.insert_ticker_snapshot("BTCUSDT", price=50000.5, snapshot_at=1000)  # type: ignore[arg-type]
+
+            db.close()
+
+    def test_timestamp_validation(self):
+        """Verify negative and non-integer timestamps are rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db)
+
+            # Negative timestamp raises ValueError
+            with self.assertRaises(ValueError):
+                _insert_test_kline(db, open_time=-1)
+
+            # Float timestamp raises TypeError
+            with self.assertRaises(TypeError):
+                _insert_test_kline(db, open_time=1700000000000.5)  # type: ignore[arg-type]
+
+            # Negative updated_at on symbol raises ValueError
+            with self.assertRaises(ValueError):
+                db.insert_symbol(
+                    symbol="ETHUSDT",
+                    base_asset="ETH",
+                    quote_asset="USDT",
+                    status="TRADING",
+                    is_spot_trading_allowed=True,
+                    is_margin_trading_allowed=False,
+                    base_asset_precision=8,
+                    quote_asset_precision=8,
+                    updated_at=-500,
+                )
+
+            db.close()
+
+    def test_symbol_validation_and_normalization(self):
+        """Verify symbol whitespace/case normalization and empty string rejection."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+
+            # Lowercase with whitespace should be normalized to stripped uppercase
+            db.insert_symbol(
+                symbol="  btcusdt  ",
+                base_asset="BTC",
+                quote_asset="USDT",
+                status="TRADING",
+                is_spot_trading_allowed=True,
+                is_margin_trading_allowed=False,
+                base_asset_precision=8,
+                quote_asset_precision=8,
+                updated_at=1700000000000,
+            )
+
+            conn = db.connection
+            row = conn.execute("SELECT symbol FROM symbols;").fetchone()
+            self.assertEqual(row["symbol"], "BTCUSDT")
+
+            # Empty symbol raises ValueError
+            with self.assertRaises(ValueError):
+                db.insert_symbol(
+                    symbol="   ",
+                    base_asset="BTC",
+                    quote_asset="USDT",
+                    status="TRADING",
+                    is_spot_trading_allowed=True,
+                    is_margin_trading_allowed=False,
+                    base_asset_precision=8,
+                    quote_asset_precision=8,
+                    updated_at=1700000000000,
+                )
+
+            # Non-string symbol raises TypeError
+            with self.assertRaises(TypeError):
+                db.insert_symbol(
+                    symbol=123,  # type: ignore[arg-type]
+                    base_asset="BTC",
+                    quote_asset="USDT",
+                    status="TRADING",
+                    is_spot_trading_allowed=True,
+                    is_margin_trading_allowed=False,
+                    base_asset_precision=8,
+                    quote_asset_precision=8,
+                    updated_at=1700000000000,
+                )
+
+            db.close()
+
+    def test_kline_interval_validation(self):
+        """Verify kline interval validation against KlineInterval enum."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db)
+
+            # Invalid interval raises ValueError
+            with self.assertRaises(ValueError):
+                _insert_test_kline(db, interval="3m")
+
+            # Valid KlineInterval enum succeeds
+            _insert_test_kline(db, interval=KlineInterval.INTERVAL_4H, open_time=1700000000000)
+            res = db.query_klines_latest("BTCUSDT", KlineInterval.INTERVAL_4H, limit=1)
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["interval"], "4h")
+
+            # Query with invalid interval raises ValueError
+            with self.assertRaises(ValueError):
+                db.query_klines_range("BTCUSDT", "invalid_interval", 1000, 2000)
+
+            db.close()
+
+    def test_limit_validation(self):
+        """Verify query limits must be positive integers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db)
+
+            # limit=0 raises ValueError
+            with self.assertRaises(ValueError):
+                db.query_klines_latest("BTCUSDT", "1h", limit=0)
+
+            # limit=-1 raises ValueError
+            with self.assertRaises(ValueError):
+                db.query_klines_latest("BTCUSDT", "1h", limit=-1)
+
+            # limit as string raises TypeError
+            with self.assertRaises(TypeError):
+                db.query_klines_latest("BTCUSDT", "1h", limit="10")  # type: ignore[arg-type]
+
+            # boolean limit raises TypeError
+            with self.assertRaises(TypeError):
+                db.query_klines_latest("BTCUSDT", "1h", limit=True)  # type: ignore[arg-type]
+
+            # ticker snapshots limit validation
+            with self.assertRaises(ValueError):
+                db.query_ticker_snapshots("BTCUSDT", limit=0)
+
+            with self.assertRaises(ValueError):
+                db.query_ticker_snapshots("BTCUSDT", limit=-10)
+
+            db.close()
 
 
 if __name__ == "__main__":
