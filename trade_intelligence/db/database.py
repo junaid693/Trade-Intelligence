@@ -1037,6 +1037,58 @@ class Database:
                 f"Failed to query latest klines for {sym}/{iv}: {exc}"
             ) from exc
 
+    def get_latest_kline_in_range(
+        self,
+        symbol: str,
+        interval: Union[str, KlineInterval],
+        start_time: int,
+        end_time: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Query the latest kline within a time range, ordered by open_time DESC LIMIT 1.
+
+        Args:
+            symbol: Trading pair symbol.
+            interval: Kline interval (e.g. '1h' or KlineInterval enum).
+            start_time: Inclusive start UTC epoch ms.
+            end_time: Inclusive end UTC epoch ms.
+
+        Returns:
+            Kline dict if found, or None if no kline exists in the range.
+
+        Raises:
+            DatabaseError: If the query fails.
+        """
+        sym = _validate_symbol(symbol)
+        iv = KlineInterval.from_value(interval).value
+        st = _validate_timestamp(start_time, "start_time")
+        et = _validate_timestamp(end_time, "end_time")
+        conn = self.connection
+        try:
+            cursor = conn.execute(
+                """
+                SELECT symbol, interval, open_time, open_price, high_price,
+                       low_price, close_price, volume, close_time,
+                       quote_asset_volume, number_of_trades,
+                       taker_buy_base_volume, taker_buy_quote_volume,
+                       raw_response_id
+                FROM klines
+                WHERE symbol = ? AND interval = ?
+                  AND open_time >= ? AND open_time <= ?
+                ORDER BY open_time DESC
+                LIMIT 1;
+                """,
+                (sym, iv, st, et),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return self._row_to_kline_dict(row)
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query latest kline in range for {sym}/{iv}: {exc}"
+            ) from exc
+
+
     @staticmethod
     def _row_to_kline_dict(row: sqlite3.Row) -> Dict[str, Any]:
         """Convert a sqlite3.Row from the klines table to a dict with Decimal values."""

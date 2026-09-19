@@ -767,7 +767,50 @@ class TestKlineRepository(unittest.TestCase):
 
             db.close()
 
+    def test_get_latest_kline_in_range(self):
+        """Verify get_latest_kline_in_range returns the newest candle in bounds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db)
+
+            base_time = 1700000000000
+            for i in range(5):
+                _insert_test_kline(
+                    db,
+                    open_time=base_time + i * 3600000,
+                    close_price=Decimal(f"{50000 + i * 100}"),
+                )
+
+            # Within range covering all 5
+            latest = db.get_latest_kline_in_range(
+                "BTCUSDT", "1h",
+                base_time,
+                base_time + 10 * 3600000,
+            )
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest["open_time"], base_time + 4 * 3600000)
+
+            # Within subrange [base_time, base_time + 2h]
+            latest_sub = db.get_latest_kline_in_range(
+                "BTCUSDT", "1h",
+                base_time,
+                base_time + 2 * 3600000,
+            )
+            self.assertIsNotNone(latest_sub)
+            self.assertEqual(latest_sub["open_time"], base_time + 2 * 3600000)
+
+            # Outside range (no candles)
+            none_res = db.get_latest_kline_in_range(
+                "BTCUSDT", "1h",
+                base_time + 10 * 3600000,
+                base_time + 20 * 3600000,
+            )
+            self.assertIsNone(none_res)
+
+            db.close()
+
     def test_kline_cross_symbol_isolation(self):
+
         """Verify kline queries do not leak between symbols."""
         with tempfile.TemporaryDirectory() as tmp:
             db = _make_test_db(tmp)

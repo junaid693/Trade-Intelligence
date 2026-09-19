@@ -16,6 +16,8 @@ from trade_intelligence.db.exceptions import (
     DatabaseInitError,
     DatabaseIntegrityError,
 )
+from trade_intelligence.klines.downloader import HistoricalKlineDownloader
+from trade_intelligence.klines.types import DownloadResult
 from trade_intelligence.universe.sync import SyncResult, UniverseSyncer
 
 __version__ = "0.1.0"
@@ -35,5 +37,6 @@ __all__ = [
     "DatabaseIntegrityError",
     "SyncResult",
     "UniverseSyncer",
+    "HistoricalKlineDownloader",
+    "DownloadResult",
 ]
-

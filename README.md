@@ -12,7 +12,7 @@ Trade Intelligence is a private, Binance-only trading intelligence application. 
 - **API Credentials**: Not required (read-only public market data only)
 - **Out of Scope**: No AI/ML, trading recommendations, automated trading, technical analysis engines, candlestick detection, Binance Square integrations, WebSockets, Futures, or frontend.
 
-## Current State: Phase 1.4.1 (Completed)
+## Current State: Phase 1.4.2 (Completed)
 
 ### Phase 1.2 — Binance Spot REST Client
 - **Endpoints Supported**: Server time (`GET /api/v3/time`), exchange information (`GET /api/v3/exchangeInfo`), ticker prices (`GET /api/v3/ticker/price`), and kline/OHLCV data (`GET /api/v3/klines`).
@@ -40,6 +40,15 @@ Trade Intelligence is a private, Binance-only trading intelligence application. 
 - **Dual Transaction Boundaries**: Raw API response archival committed in Boundary 1; normalized symbol state and status events committed atomically in Boundary 2.
 - **Idempotent Status Ledger**: Tracks initial discovery, trading status changes, and Spot permission transitions in `symbol_status_events` with zero duplicate events on repeat runs.
 - **Survivorship-Bias Protection**: Delisted or missing symbols are preserved in `symbols` as `DELISTED` (no deletions), maintaining referential integrity for all historical market data.
+
+### Phase 1.4.2 — Historical Kline Downloader
+- **Paginated Candlestick Acquisition**: Sequential historical pagination over Binance Spot `GET /api/v3/klines` up to 1,000 candles per page.
+- **Strict Boundary Advancement**: Deterministic advancement by `next_start_time = C_last.close_time_ms + 1` with a stall assertion `next_start_time > current_start_time` preventing infinite pagination loops.
+- **Forming Candle Exclusion**: Server-time clamping and filtering ensures no mutable, unfinalized candles enter historical storage. Safely terminates pagination if all returned candles are forming.
+- **Zero-Auxiliary-State Tail Resume**: Resumes forward from the latest persisted candle directly from database state (`resume=True`), with decoupled `status='already_up_to_date'`.
+- **Continuity & Gap Analysis**: `GapReport` accurately details missing intervals and candle counts across examined sequences without fabricating synthetic candles.
+- **Adaptive Rate Limiting & Telemetry**: Dynamic inspection of `X-MBX-USED-WEIGHT-*` headers, conservative configurable pacing delay, and HTTP 429 backoff with `Retry-After`.
+- **Provenance & Fault Isolation**: Commits canonical reconstructions of API payloads into `raw_api_responses` per page before batch-upserting normalized candles into `klines`, preserving full transaction boundaries.
 
 ## Development Setup
 
@@ -88,7 +97,9 @@ Trade-Intelligence/
 │   ├── test_binance_integration.py  # Opt-in live Binance API integration tests
 │   ├── test_database.py            # SQLite database foundation tests
 │   ├── test_universe_sync.py       # Universe synchronization unit tests
-│   └── test_universe_sync_integration.py # Opt-in live universe sync integration tests
+│   ├── test_universe_sync_integration.py # Opt-in live universe sync integration tests
+│   ├── test_kline_downloader.py    # Historical kline downloader unit tests
+│   └── test_kline_downloader_integration.py # Opt-in live kline download integration tests
 └── trade_intelligence/
     ├── __init__.py                  # Top-level exports
     ├── binance/
@@ -102,6 +113,11 @@ Trade-Intelligence/
     │   ├── database.py              # Database class (connection, schema, repository)
     │   ├── exceptions.py            # Database exception hierarchy
     │   └── schema.py                # Phase 1.3.1 approved DDL & version constant
+    ├── klines/
+    │   ├── __init__.py              # Klines module interface
+    │   ├── downloader.py            # HistoricalKlineDownloader implementation
+    │   ├── gap_detector.py          # Chronological gap detection & validation
+    │   └── types.py                 # DownloadResult, GapReport, KlineGap dataclasses
     └── universe/
         ├── __init__.py              # Universe module interface
         └── sync.py                  # UniverseSyncer implementation & SyncResult
