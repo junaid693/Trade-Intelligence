@@ -1207,5 +1207,521 @@ class TestDatabaseHardeningAndIntegrity(unittest.TestCase):
             db.close()
 
 
+def _generate_symbol_rows(
+    count: int = 50,
+    updated_at: int = 1700000000000,
+) -> list:
+    """Generate test symbol dicts for batch testing."""
+    rows = []
+    for i in range(count):
+        base = f"T{i:03d}"
+        rows.append({
+            "symbol": f"{base}USDT",
+            "base_asset": base,
+            "quote_asset": "USDT",
+            "status": "TRADING",
+            "is_spot_trading_allowed": True,
+            "is_margin_trading_allowed": False,
+            "base_asset_precision": 8,
+            "quote_asset_precision": 8,
+            "updated_at": updated_at,
+        })
+    return rows
+
+
+def _generate_kline_rows(
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    count: int = 500,
+    start_time: int = 1700000000000,
+) -> list:
+    """Generate realistic kline dicts for batch testing.
+
+    Creates consecutive klines at the correct interval spacing with
+    deterministic but varied OHLCV values.
+    """
+    # Interval durations in milliseconds
+    interval_ms = {
+        "5m": 300_000,
+        "15m": 900_000,
+        "1h": 3_600_000,
+        "4h": 14_400_000,
+        "1d": 86_400_000,
+    }
+    step = interval_ms[interval]
+    rows = []
+    base_price = Decimal("50000")
+    for i in range(count):
+        ot = start_time + i * step
+        # Deterministic variation based on index
+        offset = Decimal(str(i % 100)) * Decimal("10")
+        op = base_price + offset
+        hp = op + Decimal("500")
+        lp = op - Decimal("200")
+        cp = op + Decimal("100")
+        vol = Decimal("100") + Decimal(str(i % 50))
+        qav = vol * cp
+        nt = 1000 + i
+        tbv = vol / Decimal("2")
+        tqv = qav / Decimal("2")
+        rows.append({
+            "symbol": symbol,
+            "interval": interval,
+            "open_time": ot,
+            "open_price": op,
+            "high_price": hp,
+            "low_price": lp,
+            "close_price": cp,
+            "volume": vol,
+            "close_time": ot + step - 1,
+            "quote_asset_volume": qav,
+            "number_of_trades": nt,
+            "taker_buy_base_volume": tbv,
+            "taker_buy_quote_volume": tqv,
+        })
+    return rows
+
+
+class TestBatchOperations(unittest.TestCase):
+    """Tests for Phase 1.3.3 batch insert/upsert operations."""
+
+    # ------------------------------------------------------------------
+    # batch_upsert_symbols
+    # ------------------------------------------------------------------
+
+    def test_batch_upsert_symbols_inserts_new(self):
+        """Insert 50 new symbols in one call; verify all 50 exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            rows = _generate_symbol_rows(50)
+            count = db.batch_upsert_symbols(rows)
+
+            self.assertEqual(count, 50)
+            # Spot-check first and last
+            r = db.connection.execute(
+                "SELECT COUNT(*) FROM symbols"
+            ).fetchone()[0]
+            self.assertEqual(r, 50)
+            r0 = db.connection.execute(
+                "SELECT status FROM symbols WHERE symbol = ?",
+                ("T000USDT",),
+            ).fetchone()
+            self.assertEqual(r0["status"], "TRADING")
+            db.close()
+
+    def test_batch_upsert_symbols_updates_existing(self):
+        """Insert 10, then batch-upsert the same 10 with changed status."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            rows = _generate_symbol_rows(10)
+            db.batch_upsert_symbols(rows)
+
+            # Update status
+            for row in rows:
+                row["status"] = "BREAK"
+                row["updated_at"] = 1700000001000
+            count = db.batch_upsert_symbols(rows)
+
+            self.assertEqual(count, 10)
+            row = db.connection.execute(
+                "SELECT status FROM symbols WHERE symbol = ?",
+                ("T005USDT",),
+            ).fetchone()
+            self.assertEqual(row["status"], "BREAK")
+            db.close()
+
+    def test_batch_upsert_symbols_preserves_child_rows(self):
+        """Batch-upserting a symbol must not destroy child kline rows."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            _insert_test_kline(db, "BTCUSDT")
+
+            # Upsert the same symbol via batch
+            db.batch_upsert_symbols([{
+                "symbol": "BTCUSDT",
+                "base_asset": "BTC",
+                "quote_asset": "USDT",
+                "status": "BREAK",
+                "is_spot_trading_allowed": False,
+                "is_margin_trading_allowed": False,
+                "base_asset_precision": 8,
+                "quote_asset_precision": 8,
+                "updated_at": 1700000001000,
+            }])
+
+            # Child kline must survive
+            klines = db.query_klines_latest("BTCUSDT", "1h", limit=10)
+            self.assertEqual(len(klines), 1)
+            db.close()
+
+    def test_batch_upsert_symbols_empty_list(self):
+        """Calling with empty list returns 0 without error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            result = db.batch_upsert_symbols([])
+            self.assertEqual(result, 0)
+            db.close()
+
+    def test_batch_upsert_symbols_validation_failure_rolls_back(self):
+        """A bad timestamp in one row rejects the entire batch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            rows = _generate_symbol_rows(5)
+            rows[2]["updated_at"] = -1  # Invalid
+            with self.assertRaises(ValueError):
+                db.batch_upsert_symbols(rows)
+            # No rows should have been written
+            count = db.connection.execute(
+                "SELECT COUNT(*) FROM symbols"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
+            db.close()
+
+    # ------------------------------------------------------------------
+    # batch_upsert_klines
+    # ------------------------------------------------------------------
+
+    def test_batch_upsert_klines_inserts_new(self):
+        """Insert 500 klines; verify count and spot-check first/last."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=500)
+            count = db.batch_upsert_klines(rows)
+
+            self.assertEqual(count, 500)
+            db_count = db.connection.execute(
+                "SELECT COUNT(*) FROM klines WHERE symbol = 'BTCUSDT'"
+            ).fetchone()[0]
+            self.assertEqual(db_count, 500)
+
+            # Spot-check first kline
+            first = db.connection.execute(
+                "SELECT open_price FROM klines WHERE symbol='BTCUSDT' AND interval='1h' ORDER BY open_time ASC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(Decimal(first["open_price"]), Decimal("50000"))
+            db.close()
+
+    def test_batch_upsert_klines_upserts_existing(self):
+        """Insert 10, then batch-upsert same 10 with updated close_price."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=10)
+            db.batch_upsert_klines(rows)
+
+            # Update close prices
+            for row in rows:
+                row["close_price"] = Decimal("99999.99")
+            db.batch_upsert_klines(rows)
+
+            # Verify updates
+            result = db.query_klines_range(
+                "BTCUSDT", "1h",
+                start_time=1700000000000,
+                end_time=1700000000000 + 10 * 3_600_000,
+            )
+            for k in result:
+                self.assertEqual(k["close_price"], Decimal("99999.99"))
+            db.close()
+
+    def test_batch_upsert_klines_mixed_insert_update(self):
+        """Batch of 20 where 10 are new and 10 are updates."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+
+            # Insert first 10
+            first_10 = _generate_kline_rows(count=10)
+            db.batch_upsert_klines(first_10)
+
+            # Prepare batch: first 10 updated + 10 new
+            for row in first_10:
+                row["close_price"] = Decimal("77777.77")
+            next_10 = _generate_kline_rows(
+                count=10,
+                start_time=1700000000000 + 10 * 3_600_000,
+            )
+            mixed = first_10 + next_10
+            count = db.batch_upsert_klines(mixed)
+
+            self.assertEqual(count, 20)
+            total = db.connection.execute(
+                "SELECT COUNT(*) FROM klines"
+            ).fetchone()[0]
+            self.assertEqual(total, 20)
+
+            # Verify updated rows
+            updated = db.query_klines_range(
+                "BTCUSDT", "1h",
+                start_time=1700000000000,
+                end_time=1700000000000 + 10 * 3_600_000,
+            )
+            for k in updated:
+                self.assertEqual(k["close_price"], Decimal("77777.77"))
+            db.close()
+
+    def test_batch_upsert_klines_empty_list(self):
+        """Calling with empty list returns 0 without error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            result = db.batch_upsert_klines([])
+            self.assertEqual(result, 0)
+            db.close()
+
+    def test_batch_upsert_klines_validation_rejects_float(self):
+        """A float price in one row rejects the entire batch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=5)
+            rows[3]["open_price"] = 50000.0  # float, not Decimal
+            with self.assertRaises(TypeError):
+                db.batch_upsert_klines(rows)
+            # Nothing written
+            count = db.connection.execute(
+                "SELECT COUNT(*) FROM klines"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
+            db.close()
+
+    def test_batch_upsert_klines_validation_rejects_bad_interval(self):
+        """An unsupported interval rejects the entire batch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=3)
+            rows[1]["interval"] = "2h"  # unsupported
+            with self.assertRaises(ValueError):
+                db.batch_upsert_klines(rows)
+            count = db.connection.execute(
+                "SELECT COUNT(*) FROM klines"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
+            db.close()
+
+    def test_batch_upsert_klines_fk_violation_rolls_back(self):
+        """Referencing a non-existent symbol raises DatabaseIntegrityError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            # Note: no symbol inserted
+            rows = _generate_kline_rows(count=5)
+            with self.assertRaises(DatabaseIntegrityError):
+                db.batch_upsert_klines(rows)
+            count = db.connection.execute(
+                "SELECT COUNT(*) FROM klines"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
+            db.close()
+
+    def test_batch_upsert_klines_atomicity(self):
+        """100 klines where the last has FK violation → 0 rows written."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=100)
+            # Make the last row reference a non-existent symbol
+            rows[-1]["symbol"] = "NOSUCHSYMBOL"
+            with self.assertRaises(DatabaseIntegrityError):
+                db.batch_upsert_klines(rows)
+            count = db.connection.execute(
+                "SELECT COUNT(*) FROM klines"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
+            db.close()
+
+    def test_batch_upsert_klines_idempotent(self):
+        """Calling the same batch twice produces identical results."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=20)
+            db.batch_upsert_klines(rows)
+            db.batch_upsert_klines(rows)
+
+            count = db.connection.execute(
+                "SELECT COUNT(*) FROM klines"
+            ).fetchone()[0]
+            self.assertEqual(count, 20)
+
+            # Verify data is identical
+            result = db.query_klines_range(
+                "BTCUSDT", "1h",
+                start_time=1700000000000,
+                end_time=1700000000000 + 20 * 3_600_000,
+            )
+            self.assertEqual(len(result), 20)
+            for k, row in zip(result, rows):
+                self.assertEqual(k["open_price"], row["open_price"])
+                self.assertEqual(k["close_price"], row["close_price"])
+            db.close()
+
+    def test_batch_upsert_klines_with_raw_response_id(self):
+        """Klines linked to a raw_response_id preserve provenance."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+
+            # Create a raw response first
+            raw_id = db.insert_raw_api_response(
+                endpoint="/api/v3/klines",
+                response_json='[["test"]]',
+                fetched_at=1700000000000,
+            )
+
+            rows = _generate_kline_rows(count=5)
+            for row in rows:
+                row["raw_response_id"] = raw_id
+            db.batch_upsert_klines(rows)
+
+            result = db.query_klines_range(
+                "BTCUSDT", "1h",
+                start_time=1700000000000,
+                end_time=1700000000000 + 5 * 3_600_000,
+            )
+            for k in result:
+                self.assertEqual(k["raw_response_id"], raw_id)
+            db.close()
+
+    # ------------------------------------------------------------------
+    # batch_insert_ticker_snapshots
+    # ------------------------------------------------------------------
+
+    def test_batch_insert_ticker_snapshots(self):
+        """Insert 100 snapshots; verify count and ordering."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+
+            snapshots = [
+                {
+                    "symbol": "BTCUSDT",
+                    "price": Decimal("50000") + Decimal(str(i)),
+                    "snapshot_at": 1700000000000 + i * 1000,
+                }
+                for i in range(100)
+            ]
+            count = db.batch_insert_ticker_snapshots(snapshots)
+            self.assertEqual(count, 100)
+
+            result = db.query_ticker_snapshots("BTCUSDT", limit=100)
+            self.assertEqual(len(result), 100)
+            # Should be newest-first
+            self.assertGreater(
+                result[0]["snapshot_at"],
+                result[-1]["snapshot_at"],
+            )
+            db.close()
+
+    def test_batch_insert_ticker_snapshots_empty(self):
+        """Calling with empty list returns 0 without error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            result = db.batch_insert_ticker_snapshots([])
+            self.assertEqual(result, 0)
+            db.close()
+
+    # ------------------------------------------------------------------
+    # batch_insert_raw_api_responses
+    # ------------------------------------------------------------------
+
+    def test_batch_insert_raw_api_responses(self):
+        """Insert 5 raw responses; verify returned IDs and content_hash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            responses = [
+                {
+                    "endpoint": "/api/v3/klines",
+                    "response_json": json.dumps({"batch": i}),
+                    "fetched_at": 1700000000000 + i * 1000,
+                }
+                for i in range(5)
+            ]
+            ids = db.batch_insert_raw_api_responses(responses)
+
+            self.assertEqual(len(ids), 5)
+            # IDs should be sequential
+            for i in range(1, len(ids)):
+                self.assertEqual(ids[i], ids[i - 1] + 1)
+
+            # Verify content_hash computed
+            for i, rid in enumerate(ids):
+                row = db.connection.execute(
+                    "SELECT content_hash FROM raw_api_responses WHERE id = ?",
+                    (rid,),
+                ).fetchone()
+                expected_hash = hashlib.sha256(
+                    json.dumps({"batch": i}).encode("utf-8")
+                ).hexdigest()
+                self.assertEqual(row["content_hash"], expected_hash)
+            db.close()
+
+    def test_batch_insert_raw_api_responses_with_ingestion_run(self):
+        """Link raw responses to an ingestion run; verify FK."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            run_id = db.create_ingestion_run(
+                run_type="kline_backfill",
+                started_at=1700000000000,
+            )
+            responses = [
+                {
+                    "endpoint": "/api/v3/klines",
+                    "response_json": json.dumps({"run": i}),
+                    "fetched_at": 1700000000000 + i * 1000,
+                    "ingestion_run_id": run_id,
+                }
+                for i in range(3)
+            ]
+            ids = db.batch_insert_raw_api_responses(responses)
+            self.assertEqual(len(ids), 3)
+
+            # Verify FK linkage
+            for rid in ids:
+                row = db.connection.execute(
+                    "SELECT ingestion_run_id FROM raw_api_responses WHERE id = ?",
+                    (rid,),
+                ).fetchone()
+                self.assertEqual(row["ingestion_run_id"], run_id)
+            db.close()
+
+    # ------------------------------------------------------------------
+    # Performance gates
+    # ------------------------------------------------------------------
+
+    def test_batch_performance_500_klines(self):
+        """Insert 500 klines in under 1 second."""
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=500)
+
+            start = time.perf_counter()
+            db.batch_upsert_klines(rows)
+            elapsed = time.perf_counter() - start
+
+            self.assertLess(elapsed, 1.0, f"500 klines took {elapsed:.3f}s (> 1.0s)")
+            db.close()
+
+    def test_batch_performance_1000_klines(self):
+        """Insert 1000 klines in under 2 seconds."""
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            rows = _generate_kline_rows(count=1000)
+
+            start = time.perf_counter()
+            db.batch_upsert_klines(rows)
+            elapsed = time.perf_counter() - start
+
+            self.assertLess(elapsed, 2.0, f"1000 klines took {elapsed:.3f}s (> 2.0s)")
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

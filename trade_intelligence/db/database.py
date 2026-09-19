@@ -1,8 +1,9 @@
 """SQLite database foundation for Trade Intelligence.
 
 Provides connection management, schema initialization, and repository methods
-for all approved Phase 1.3.1 tables. Financial values are stored as TEXT
-(Python Decimal) and timestamps as INTEGER (UTC epoch milliseconds).
+for all approved Phase 1.3.1 tables. Includes single-row and batch insert/upsert
+operations. Financial values are stored as TEXT (Python Decimal) and timestamps
+as INTEGER (UTC epoch milliseconds).
 """
 
 import hashlib
@@ -11,6 +12,11 @@ import sqlite3
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+try:
+    from typing import TypedDict, NotRequired
+except ImportError:
+    from typing_extensions import TypedDict, NotRequired
 
 from trade_intelligence.binance.enums import KlineInterval
 from trade_intelligence.db.exceptions import (
@@ -29,6 +35,29 @@ DEFAULT_PRAGMAS: Dict[str, Any] = {
     "busy_timeout": 5000,  # 5 seconds
     "foreign_keys": 1,     # Always enforced
 }
+
+
+class KlineRow(TypedDict):
+    """Structured input for a single kline row in batch operations.
+
+    All fields match the ``klines`` table columns. Financial values must be
+    ``Decimal`` instances; timestamps must be non-negative ``int`` epoch ms.
+    """
+
+    symbol: str
+    interval: str
+    open_time: int
+    open_price: Decimal
+    high_price: Decimal
+    low_price: Decimal
+    close_price: Decimal
+    volume: Decimal
+    close_time: int
+    quote_asset_volume: Decimal
+    number_of_trades: int
+    taker_buy_base_volume: Decimal
+    taker_buy_quote_volume: Decimal
+    raw_response_id: NotRequired[Optional[int]]
 
 
 def _rollback_quietly(conn: sqlite3.Connection) -> None:
@@ -86,6 +115,55 @@ def _validate_limit(limit: int, name: str = "limit") -> int:
     if limit < 1:
         raise ValueError(f"Invalid {name}: {limit}. Limit must be a positive integer.")
     return limit
+
+
+def _validate_kline_row(row: Dict[str, Any], index: int) -> Tuple:
+    """Validate a kline dict and return a parameter tuple for executemany.
+
+    Applies the same validation as ``insert_kline`` / ``upsert_kline``:
+    symbol normalization, interval enum validation, timestamp validation,
+    and finite-Decimal enforcement for all financial fields.
+
+    Args:
+        row: Dict with KlineRow keys.
+        index: Row index in the batch (for error messages).
+
+    Returns:
+        Tuple of validated parameters in column order.
+
+    Raises:
+        TypeError: If a value has the wrong type.
+        ValueError: If a value is invalid (e.g. unsupported interval).
+    """
+    try:
+        sym = _validate_symbol(row["symbol"])
+        iv = KlineInterval.from_value(row["interval"]).value
+        ot = _validate_timestamp(row["open_time"], "open_time")
+        ct = _validate_timestamp(row["close_time"], "close_time")
+        op = _to_decimal_str(row["open_price"], "open_price")
+        hp = _to_decimal_str(row["high_price"], "high_price")
+        lp = _to_decimal_str(row["low_price"], "low_price")
+        cp = _to_decimal_str(row["close_price"], "close_price")
+        vol = _to_decimal_str(row["volume"], "volume")
+        qav = _to_decimal_str(row["quote_asset_volume"], "quote_asset_volume")
+        tbv = _to_decimal_str(row["taker_buy_base_volume"], "taker_buy_base_volume")
+        tqv = _to_decimal_str(row["taker_buy_quote_volume"], "taker_buy_quote_volume")
+        nt = row["number_of_trades"]
+        if isinstance(nt, bool) or not isinstance(nt, int):
+            raise TypeError(
+                f"number_of_trades must be an integer, got {type(nt).__name__}: {nt!r}"
+            )
+        rid = row.get("raw_response_id")
+    except KeyError as exc:
+        raise ValueError(
+            f"Kline row at index {index} is missing required field: {exc}"
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(
+            f"Kline row at index {index}: {exc}"
+        ) from exc
+
+    return (sym, iv, ot, op, hp, lp, cp, vol, ct, qav, nt, tbv, tqv, rid)
 
 
 class Database:
@@ -919,4 +997,325 @@ class Database:
         except sqlite3.Error as exc:
             raise DatabaseError(
                 f"Failed to query ticker snapshots for '{sym}': {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Batch operations
+    # ------------------------------------------------------------------
+
+    def batch_upsert_symbols(
+        self,
+        symbols: List[Dict[str, Any]],
+    ) -> int:
+        """Insert or update multiple symbol records in a single transaction.
+
+        Uses the same ``INSERT ... ON CONFLICT (symbol) DO UPDATE`` semantics
+        as :meth:`insert_symbol`. All rows are validated before any SQL is
+        executed (fail-fast). On any failure the entire batch is rolled back.
+
+        Args:
+            symbols: List of dicts, each with the same keys as
+                     :meth:`insert_symbol` parameters: ``symbol``,
+                     ``base_asset``, ``quote_asset``, ``status``,
+                     ``is_spot_trading_allowed``, ``is_margin_trading_allowed``,
+                     ``base_asset_precision``, ``quote_asset_precision``,
+                     ``updated_at``.
+
+        Returns:
+            Count of rows processed.
+
+        Raises:
+            TypeError: If any row has an invalid type.
+            ValueError: If any row has an invalid value.
+            DatabaseIntegrityError: If a constraint violation occurs.
+            DatabaseError: If the batch operation fails.
+        """
+        if not symbols:
+            return 0
+
+        # Validate all rows before touching the database
+        validated: List[Tuple] = []
+        for i, row in enumerate(symbols):
+            try:
+                sym = _validate_symbol(row["symbol"])
+                ts = _validate_timestamp(row["updated_at"], "updated_at")
+                validated.append((
+                    sym,
+                    row["base_asset"],
+                    row["quote_asset"],
+                    row["status"],
+                    int(row["is_spot_trading_allowed"]),
+                    int(row["is_margin_trading_allowed"]),
+                    row["base_asset_precision"],
+                    row["quote_asset_precision"],
+                    ts,
+                ))
+            except KeyError as exc:
+                raise ValueError(
+                    f"Symbol row at index {i} is missing required field: {exc}"
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(
+                    f"Symbol row at index {i}: {exc}"
+                ) from exc
+
+        conn = self.connection
+        sql = """
+            INSERT INTO symbols
+                (symbol, base_asset, quote_asset, status,
+                 is_spot_trading_allowed, is_margin_trading_allowed,
+                 base_asset_precision, quote_asset_precision, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (symbol) DO UPDATE SET
+                base_asset              = excluded.base_asset,
+                quote_asset             = excluded.quote_asset,
+                status                  = excluded.status,
+                is_spot_trading_allowed = excluded.is_spot_trading_allowed,
+                is_margin_trading_allowed = excluded.is_margin_trading_allowed,
+                base_asset_precision    = excluded.base_asset_precision,
+                quote_asset_precision   = excluded.quote_asset_precision,
+                updated_at              = excluded.updated_at;
+        """
+        try:
+            conn.execute("BEGIN")
+            conn.executemany(sql, validated)
+            conn.execute("COMMIT")
+            return len(validated)
+        except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
+            raise DatabaseIntegrityError(
+                f"Integrity error in batch symbol upsert: {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            _rollback_quietly(conn)
+            raise DatabaseError(
+                f"Failed to batch upsert symbols: {exc}"
+            ) from exc
+
+    def batch_upsert_klines(
+        self,
+        klines: List[Dict[str, Any]],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """Insert or update multiple kline rows in a single transaction.
+
+        Uses the same ``INSERT ... ON CONFLICT (symbol, interval, open_time)
+        DO UPDATE`` semantics as :meth:`upsert_kline`. All rows are validated
+        before any SQL is executed (fail-fast). On any failure the entire
+        batch is rolled back.
+
+        The ``chunk_size`` parameter controls how many rows are sent per
+        ``executemany`` call for memory efficiency. It does **not** affect
+        transaction scope — the entire batch is always one atomic transaction.
+
+        Args:
+            klines: List of dicts matching :class:`KlineRow` keys.
+            chunk_size: Number of rows per ``executemany`` call. Default 500.
+
+        Returns:
+            Count of rows processed.
+
+        Raises:
+            TypeError: If any row has an invalid type.
+            ValueError: If any row has an invalid value or chunk_size < 1.
+            DatabaseIntegrityError: If a FK/constraint violation occurs.
+            DatabaseError: If the batch operation fails.
+        """
+        if not klines:
+            return 0
+
+        if chunk_size < 1:
+            raise ValueError(
+                f"chunk_size must be a positive integer, got: {chunk_size}"
+            )
+
+        # Validate all rows before touching the database
+        validated: List[Tuple] = [
+            _validate_kline_row(row, i) for i, row in enumerate(klines)
+        ]
+
+        conn = self.connection
+        sql = """
+            INSERT INTO klines
+                (symbol, interval, open_time, open_price, high_price, low_price,
+                 close_price, volume, close_time, quote_asset_volume,
+                 number_of_trades, taker_buy_base_volume, taker_buy_quote_volume,
+                 raw_response_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (symbol, interval, open_time) DO UPDATE SET
+                open_price              = excluded.open_price,
+                high_price              = excluded.high_price,
+                low_price               = excluded.low_price,
+                close_price             = excluded.close_price,
+                volume                  = excluded.volume,
+                close_time              = excluded.close_time,
+                quote_asset_volume      = excluded.quote_asset_volume,
+                number_of_trades        = excluded.number_of_trades,
+                taker_buy_base_volume   = excluded.taker_buy_base_volume,
+                taker_buy_quote_volume  = excluded.taker_buy_quote_volume,
+                raw_response_id         = excluded.raw_response_id;
+        """
+        try:
+            conn.execute("BEGIN")
+            for start in range(0, len(validated), chunk_size):
+                conn.executemany(sql, validated[start:start + chunk_size])
+            conn.execute("COMMIT")
+            return len(validated)
+        except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
+            raise DatabaseIntegrityError(
+                f"Integrity error in batch kline upsert: {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            _rollback_quietly(conn)
+            raise DatabaseError(
+                f"Failed to batch upsert klines: {exc}"
+            ) from exc
+
+    def batch_insert_ticker_snapshots(
+        self,
+        snapshots: List[Dict[str, Any]],
+    ) -> int:
+        """Insert multiple ticker snapshots in a single transaction.
+
+        Ticker snapshots are append-only (each gets a unique autoincrement id).
+        All rows are validated before any SQL is executed. On any failure the
+        entire batch is rolled back.
+
+        Args:
+            snapshots: List of dicts with keys: ``symbol``, ``price``,
+                       ``snapshot_at``, and optionally ``raw_response_id``.
+
+        Returns:
+            Count of rows processed.
+
+        Raises:
+            TypeError: If any row has an invalid type.
+            ValueError: If any row has an invalid value.
+            DatabaseIntegrityError: If a FK constraint is violated.
+            DatabaseError: If the batch operation fails.
+        """
+        if not snapshots:
+            return 0
+
+        validated: List[Tuple] = []
+        for i, row in enumerate(snapshots):
+            try:
+                sym = _validate_symbol(row["symbol"])
+                p = _to_decimal_str(row["price"], "price")
+                ts = _validate_timestamp(row["snapshot_at"], "snapshot_at")
+                rid = row.get("raw_response_id")
+                validated.append((sym, p, ts, rid))
+            except KeyError as exc:
+                raise ValueError(
+                    f"Ticker snapshot row at index {i} is missing required field: {exc}"
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(
+                    f"Ticker snapshot row at index {i}: {exc}"
+                ) from exc
+
+        conn = self.connection
+        sql = """
+            INSERT INTO ticker_snapshots
+                (symbol, price, snapshot_at, raw_response_id)
+            VALUES (?, ?, ?, ?);
+        """
+        try:
+            conn.execute("BEGIN")
+            conn.executemany(sql, validated)
+            conn.execute("COMMIT")
+            return len(validated)
+        except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
+            raise DatabaseIntegrityError(
+                f"Integrity error in batch ticker snapshot insert: {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            _rollback_quietly(conn)
+            raise DatabaseError(
+                f"Failed to batch insert ticker snapshots: {exc}"
+            ) from exc
+
+    def batch_insert_raw_api_responses(
+        self,
+        responses: List[Dict[str, Any]],
+    ) -> List[int]:
+        """Insert multiple raw API responses in a single transaction.
+
+        Unlike other batch methods, this uses individual ``execute`` calls
+        (not ``executemany``) because the caller needs the ``lastrowid`` of
+        each inserted record for provenance linking (e.g. setting
+        ``klines.raw_response_id``).
+
+        SHA-256 content hashes are computed automatically for each response.
+
+        Args:
+            responses: List of dicts with keys: ``endpoint``,
+                       ``response_json``, ``fetched_at``, and optionally
+                       ``params_json`` and ``ingestion_run_id``.
+
+        Returns:
+            List of inserted rowids in the same order as the input.
+
+        Raises:
+            TypeError: If any row has an invalid type.
+            ValueError: If any row has an invalid value.
+            DatabaseIntegrityError: If a FK constraint is violated.
+            DatabaseError: If the batch operation fails.
+        """
+        if not responses:
+            return []
+
+        # Validate all rows before touching the database
+        validated: List[Tuple] = []
+        for i, row in enumerate(responses):
+            try:
+                ts = _validate_timestamp(row["fetched_at"], "fetched_at")
+                response_json = row["response_json"]
+                content_hash = hashlib.sha256(
+                    response_json.encode("utf-8")
+                ).hexdigest()
+                validated.append((
+                    row["endpoint"],
+                    row.get("params_json"),
+                    response_json,
+                    content_hash,
+                    row.get("ingestion_run_id"),
+                    ts,
+                ))
+            except KeyError as exc:
+                raise ValueError(
+                    f"Raw response row at index {i} is missing required field: {exc}"
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(
+                    f"Raw response row at index {i}: {exc}"
+                ) from exc
+
+        conn = self.connection
+        sql = """
+            INSERT INTO raw_api_responses
+                (endpoint, params_json, response_json, content_hash,
+                 ingestion_run_id, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+        """
+        ids: List[int] = []
+        try:
+            conn.execute("BEGIN")
+            for params in validated:
+                cursor = conn.execute(sql, params)
+                ids.append(cursor.lastrowid)  # type: ignore[arg-type]
+            conn.execute("COMMIT")
+            return ids
+        except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
+            raise DatabaseIntegrityError(
+                f"Integrity error in batch raw response insert: {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            _rollback_quietly(conn)
+            raise DatabaseError(
+                f"Failed to batch insert raw responses: {exc}"
             ) from exc
