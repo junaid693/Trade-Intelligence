@@ -992,6 +992,53 @@ class Database:
                 f"Failed to query klines range for {sym}/{iv}: {exc}"
             ) from exc
 
+    def query_kline_open_times_range(
+        self,
+        symbol: str,
+        interval: Union[str, KlineInterval],
+        start_time: int,
+        end_time: int,
+    ) -> List[int]:
+        """Query kline open_time values within a time range, ordered ASC.
+
+        Lightweight alternative to :meth:`query_klines_range` that returns
+        only integer open_time timestamps without allocating full kline dicts.
+        Useful for continuity / coverage scanning over large ranges.
+
+        Args:
+            symbol: Trading pair symbol.
+            interval: Kline interval (e.g. '1h' or KlineInterval enum).
+            start_time: Inclusive start UTC epoch ms (open_time >= start_time).
+            end_time: Inclusive end UTC epoch ms (open_time <= end_time).
+
+        Returns:
+            List of integer open_time timestamps ordered ascending.
+
+        Raises:
+            DatabaseError: If the query fails.
+        """
+        sym = _validate_symbol(symbol)
+        iv = KlineInterval.from_value(interval).value
+        st = _validate_timestamp(start_time, "start_time")
+        et = _validate_timestamp(end_time, "end_time")
+        conn = self.connection
+        try:
+            rows = conn.execute(
+                """
+                SELECT open_time
+                FROM klines
+                WHERE symbol = ? AND interval = ?
+                  AND open_time >= ? AND open_time <= ?
+                ORDER BY open_time ASC;
+                """,
+                (sym, iv, st, et),
+            ).fetchall()
+            return [int(row[0]) for row in rows]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query kline open times for {sym}/{iv}: {exc}"
+            ) from exc
+
     def query_klines_latest(
         self,
         symbol: str,

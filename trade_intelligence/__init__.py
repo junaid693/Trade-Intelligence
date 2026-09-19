@@ -17,6 +17,11 @@ from trade_intelligence.db.exceptions import (
     DatabaseIntegrityError,
 )
 from trade_intelligence.klines.downloader import HistoricalKlineDownloader
+from trade_intelligence.klines.pipeline import (
+    HistoricalDataOrchestrator,
+    PipelineRequest,
+    PipelineResult,
+)
 from trade_intelligence.klines.types import DownloadResult
 from trade_intelligence.universe.sync import SyncResult, UniverseSyncer
 
@@ -39,4 +44,7 @@ __all__ = [
     "UniverseSyncer",
     "HistoricalKlineDownloader",
     "DownloadResult",
+    "HistoricalDataOrchestrator",
+    "PipelineRequest",
+    "PipelineResult",
 ]
