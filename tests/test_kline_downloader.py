@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 from trade_intelligence.binance.client import BinanceRestClient
 from trade_intelligence.binance.enums import KlineInterval
 from trade_intelligence.binance.exceptions import (
+    BinanceConnectionError,
     BinanceHttpError,
     BinanceTimeoutError,
 )
@@ -545,6 +546,360 @@ class TestKlineDownloader(unittest.TestCase):
         integrity = conn.execute("PRAGMA integrity_check;").fetchone()
         self.assertEqual(integrity[0], "ok")
 
+    def test_pagination_exact_1000_candles_no_extra_request(self):
+        """Area 1: Exact 1000 candles completes in 1 page without extra empty request."""
+        base_time = 1700000000000
+        page = [_make_mock_kline(base_time + i * 3600000) for i in range(1000)]
+        self.mock_client.get_klines.return_value = page
+
+        result = self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 999 * 3600000,
+            resume=False,
+        )
+
+        self.assertEqual(result.records_stored, 1000)
+        self.assertEqual(result.pages_fetched, 1)
+        self.mock_client.get_klines.assert_called_once()
+
+    def test_pagination_unordered_candles_sorted_safely(self):
+        """Area 1 & Bug 2: Out-of-order candles in API page are sorted before advancement."""
+        base_time = 1700000000000
+        k0 = _make_mock_kline(base_time)
+        k1 = _make_mock_kline(base_time + 3600000)
+        k2 = _make_mock_kline(base_time + 2 * 3600000)
+        # API returns candles in scrambled order: [k2, k0, k1]
+        self.mock_client.get_klines.return_value = [k2, k0, k1]
+
+        result = self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 2 * 3600000,
+            resume=False,
+        )
+
+        self.assertEqual(result.records_stored, 3)
+        # Verify rows in DB are ordered and next start time was advanced past k2
+        rows = self.db.query_klines_range("BTCUSDT", "1h", base_time, base_time + 3 * 3600000)
+        self.assertEqual([r["open_time"] for r in rows], [base_time, base_time + 3600000, base_time + 2 * 3600000])
+
+    def test_pagination_empty_api_response_on_historical_range(self):
+        """Area 1 & 4 (Bug 4): Empty response for historical past range reports accurate gap."""
+        base_time = 1700000000000
+        self.mock_client.get_klines.return_value = []
+
+        result = self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 4 * 3600000,
+            resume=False,
+        )
+
+        self.assertEqual(result.records_stored, 0)
+        self.assertEqual(result.pages_fetched, 1)
+        self.assertEqual(result.gap_report.total_expected_candles, 5)
+        self.assertEqual(result.gap_report.total_actual_candles, 0)
+        self.assertEqual(result.gap_report.total_missing_candles, 5)
+        self.assertEqual(result.gap_report.coverage_ratio, 0.0)
+
+    def test_forming_candle_server_time_equals_close_time_excluded(self):
+        """Area 2: Candle with close_time equal to server_time is treated as forming."""
+        server_time = 1700000000000 + 3600000 - 1
+        self.mock_client.get_server_time.return_value = ServerTime.from_raw({"serverTime": server_time})
+
+        # Candle 0 closes exactly at server_time
+        k0 = _make_mock_kline(1700000000000)
+        self.assertEqual(k0.close_time_ms, server_time)
+        self.mock_client.get_klines.return_value = [k0]
+
+        result = self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=1700000000000,
+            end_time=1700000000000 + 3600000,
+            resume=False,
+        )
+        self.assertEqual(result.records_stored, 0, "Candle closing at server_time must be excluded")
+
+    def test_tail_resume_with_existing_candle_outside_range(self):
+        """Area 3: Tail resume ignores existing candles outside the requested bounds."""
+        base_time = 1700000000000 - (1700000000000 % 3600000)
+        # Seed an older candle outside requested start_time
+        older_candle = _make_mock_kline(base_time - 100 * 3600000)
+        self.mock_client.get_klines.return_value = [older_candle]
+        self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time - 100 * 3600000,
+            end_time=base_time - 99 * 3600000,
+            resume=False,
+        )
+        self.mock_client.get_klines.reset_mock()
+
+        # Download a new window starting at base_time with resume=True
+        new_candle = _make_mock_kline(base_time)
+        self.mock_client.get_klines.return_value = [new_candle]
+        result = self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 3600000,
+            resume=True,
+        )
+
+        # Must start from base_time, ignoring older_candle
+        self.assertEqual(result.effective_start_time, base_time)
+        self.assertEqual(result.records_stored, 1)
+
+    def test_tail_resume_after_partial_page_failure(self):
+        """Area 3 & 7: Successful resume after partial failure with clean provenance."""
+        base_time = 1700000000000 - (1700000000000 % 3600000)
+        page1 = [_make_mock_kline(base_time + i * 3600000) for i in range(1000)]
+        # Page 1 succeeds, Page 2 raises transient connection error
+        self.mock_client.get_klines.side_effect = [
+            page1,
+            BinanceConnectionError("Connection lost on page 2"),
+            BinanceConnectionError("Connection lost on page 2"),
+            BinanceConnectionError("Connection lost on page 2"),
+            BinanceConnectionError("Connection lost on page 2"),
+        ]
+
+        with self.assertRaises(BinanceConnectionError):
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=base_time,
+                end_time=base_time + 1500 * 3600000,
+                resume=False,
+            )
+
+        # Page 1 survived in DB
+        rows_page1 = self.db.query_klines_range("BTCUSDT", "1h", base_time, base_time + 1500 * 3600000)
+        self.assertEqual(len(rows_page1), 1000)
+
+        # Now resume
+        page2_start = page1[-1].close_time_ms + 1
+        page2 = [_make_mock_kline(page2_start + i * 3600000) for i in range(500)]
+        self.mock_client.get_klines.side_effect = [page2]
+
+        resume_result = self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 1500 * 3600000,
+            resume=True,
+        )
+
+        self.assertEqual(resume_result.status, "completed")
+        self.assertEqual(resume_result.records_stored, 500)
+        total_rows = self.db.query_klines_range("BTCUSDT", "1h", base_time, base_time + 2000 * 3600000)
+        self.assertEqual(len(total_rows), 1500)
+
+    def test_idempotency_overlapping_ranges(self):
+        """Area 5: Repeated download with overlapping range updates without row duplication."""
+        base_time = 1700000000000
+        # First download: hours 0..10 (11 candles)
+        batch1 = [_make_mock_kline(base_time + i * 3600000) for i in range(11)]
+        self.mock_client.get_klines.return_value = batch1
+        self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 10 * 3600000,
+            resume=False,
+        )
+
+        # Second download: hours 5..15 (11 candles, hours 5..10 overlap)
+        batch2 = [_make_mock_kline(base_time + (5 + i) * 3600000) for i in range(11)]
+        self.mock_client.get_klines.return_value = batch2
+        self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time + 5 * 3600000,
+            end_time=base_time + 15 * 3600000,
+            resume=False,
+        )
+
+        # Total distinct candles must be exactly 16 (0 to 15)
+        total_rows = self.db.query_klines_range("BTCUSDT", "1h", base_time, base_time + 20 * 3600000)
+        self.assertEqual(len(total_rows), 16)
+
+    def test_provenance_canonical_reconstruction_identical_to_binance(self):
+        """Area 6: Stored JSON payload in raw_api_responses strictly matches Binance raw items."""
+        base_time = 1700000000000
+        mock_kline = _make_mock_kline(base_time)
+        self.mock_client.get_klines.return_value = [mock_kline]
+
+        result = self.downloader.download_historical_klines(
+            symbol="BTCUSDT",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 3600000,
+            resume=False,
+        )
+
+        conn = self.db.connection
+        raw_row = conn.execute(
+            "SELECT response_json FROM raw_api_responses WHERE ingestion_run_id = ?;",
+            (result.run_id,),
+        ).fetchone()
+
+        payload = json.loads(raw_row["response_json"])
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0], mock_kline.raw)
+
+    def test_http_418_ip_ban_not_retried(self):
+        """Area 8: HTTP 418 (IP ban) raises immediately without retry loops."""
+        self.mock_client.get_klines.side_effect = BinanceHttpError(
+            status_code=418,
+            message="IP banned until timestamp",
+        )
+
+        with self.assertRaises(BinanceHttpError) as ctx:
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=1700000000000,
+                end_time=1700000000000 + 3600000,
+                resume=False,
+            )
+
+        self.assertEqual(ctx.exception.status_code, 418)
+        self.mock_client.get_klines.assert_called_once()
+
+    def test_http_400_bad_request_not_retried(self):
+        """Area 8: HTTP 400 raises immediately without retry loops."""
+        self.mock_client.get_klines.side_effect = BinanceHttpError(
+            status_code=400,
+            message="Illegal characters found in parameter",
+        )
+
+        with self.assertRaises(BinanceHttpError) as ctx:
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=1700000000000,
+                end_time=1700000000000 + 3600000,
+                resume=False,
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.mock_client.get_klines.assert_called_once()
+
+    def test_rate_limit_telemetry_high_used_weight_throttles(self):
+        """Area 9: X-MBX-USED-WEIGHT > 1000 throttles pacing delay safely."""
+        self.downloader._last_headers = {"x-mbx-used-weight-1m": "1050"}
+        with patch("time.sleep") as mock_sleep:
+            self.downloader._handle_pacing_and_telemetry(base_delay_ms=200.0)
+            mock_sleep.assert_called_once_with(1.0)
+
+    def test_rate_limit_telemetry_malformed_header_ignored(self):
+        """Area 9: Malformed header value does not crash telemetry parsing."""
+        self.downloader._last_headers = {"x-mbx-used-weight-1m": "not-an-int"}
+        with patch("time.sleep") as mock_sleep:
+            self.downloader._handle_pacing_and_telemetry(base_delay_ms=200.0)
+            mock_sleep.assert_called_once_with(0.2)
+
+    def test_symbol_normalization_and_validation(self):
+        """Area 10 & 11: Symbol string normalization and type checks."""
+        base_time = 1700000000000
+        # Lowercase symbol is normalized to uppercase and succeeds
+        self.mock_client.get_klines.return_value = [_make_mock_kline(base_time)]
+        result = self.downloader.download_historical_klines(
+            symbol="btcusdt",
+            interval="1h",
+            start_time=base_time,
+            end_time=base_time + 3600000,
+            resume=False,
+        )
+        self.assertEqual(result.symbol, "BTCUSDT")
+
+        # Non-string symbol raises TypeError
+        with self.assertRaises(TypeError):
+            self.downloader.download_historical_klines(
+                symbol=123,  # type: ignore
+                interval="1h",
+                start_time=base_time,
+                end_time=base_time + 3600000,
+            )
+
+        # Empty symbol raises ValueError
+        with self.assertRaises(ValueError):
+            self.downloader.download_historical_klines(
+                symbol="   ",
+                interval="1h",
+                start_time=base_time,
+                end_time=base_time + 3600000,
+            )
+
+    def test_validation_rejects_bool_and_invalid_timestamps(self):
+        """Area 11 (Bug 1): Timestamps reject bool and non-integer types."""
+        # Bool start_time raises TypeError
+        with self.assertRaises(TypeError):
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=True,  # type: ignore
+                end_time=1700000000000,
+            )
+
+        # Bool end_time raises TypeError
+        with self.assertRaises(TypeError):
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=1700000000000,
+                end_time=False,  # type: ignore
+            )
+
+        # Negative start_time raises ValueError
+        with self.assertRaises(ValueError):
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=-1,
+                end_time=1700000000000,
+            )
+
+        # start_time > end_time raises ValueError
+        with self.assertRaises(ValueError):
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=1700000000000,
+                end_time=1600000000000,
+            )
+
+    def test_validation_rejects_non_bool_resume(self):
+        """Area 11 (Bug 1): resume flag rejects non-boolean types."""
+        with self.assertRaises(TypeError):
+            self.downloader.download_historical_klines(
+                symbol="BTCUSDT",
+                interval="1h",
+                start_time=1700000000000,
+                end_time=1700000000000 + 3600000,
+                resume="yes",  # type: ignore
+            )
+
+    def test_validation_rejects_invalid_delay_and_retries(self):
+        """Area 11 (Bug 1): Downloader constructor validates delay and retries."""
+        with self.assertRaises(TypeError):
+            HistoricalKlineDownloader(self.db, self.mock_client, request_delay_ms="fast")  # type: ignore
+        with self.assertRaises(TypeError):
+            HistoricalKlineDownloader(self.db, self.mock_client, request_delay_ms=True)  # type: ignore
+        with self.assertRaises(ValueError):
+            HistoricalKlineDownloader(self.db, self.mock_client, request_delay_ms=-1.0)
+        with self.assertRaises(TypeError):
+            HistoricalKlineDownloader(self.db, self.mock_client, max_retries="three")  # type: ignore
+        with self.assertRaises(TypeError):
+            HistoricalKlineDownloader(self.db, self.mock_client, max_retries=True)  # type: ignore
+        with self.assertRaises(ValueError):
+            HistoricalKlineDownloader(self.db, self.mock_client, max_retries=-1)
+
 
 class TestGapDetector(unittest.TestCase):
     """Unit tests for standalone detect_kline_gaps and interval_to_milliseconds."""
@@ -580,9 +935,6 @@ class TestGapDetector(unittest.TestCase):
         self.assertEqual(gap.gap_end_ms, 1000 + 4 * 300000 - 1)
 
     def test_detect_kline_gaps_leading_and_trailing(self):
-        # Examined sequence [3h, 4h], expected range [1h, 6h]
-        # Missing leading: 1h, 2h (2 candles)
-        # Missing trailing: 5h, 6h (2 candles)
         base = 10000000
         h = 3600000
         klines = [{"open_time": base + 2 * h}, {"open_time": base + 3 * h}]
@@ -598,3 +950,48 @@ class TestGapDetector(unittest.TestCase):
         self.assertEqual(len(report.gaps), 2)
         self.assertEqual(report.gaps[0].missing_candles, 2)
         self.assertEqual(report.gaps[1].missing_candles, 2)
+
+    def test_gap_detector_duplicate_timestamps_deduplicated(self):
+        """Area 4 & Bug 3: Duplicate timestamps are deduplicated and don't inflate counts."""
+        klines = [
+            {"open_time": 1000},
+            {"open_time": 1000},
+            {"open_time": 1000 + 3600000},
+        ]
+        report = detect_kline_gaps("BTCUSDT", "1h", klines)
+        self.assertEqual(report.total_actual_candles, 2)
+        self.assertEqual(report.total_missing_candles, 0)
+        self.assertEqual(report.total_expected_candles, 2)
+        self.assertEqual(report.coverage_ratio, 1.0)
+
+    def test_gap_detector_unsorted_input_ordered_safely(self):
+        """Area 4: Unsorted input is safely ordered before gap detection."""
+        klines = [
+            {"open_time": 1000 + 2 * 3600000},
+            {"open_time": 1000},
+            {"open_time": 1000 + 3600000},
+        ]
+        report = detect_kline_gaps("BTCUSDT", "1h", klines)
+        self.assertEqual(report.total_actual_candles, 3)
+        self.assertEqual(report.total_missing_candles, 0)
+        self.assertEqual(report.coverage_ratio, 1.0)
+        self.assertEqual(len(report.gaps), 0)
+
+    def test_gap_detector_input_validation(self):
+        """Area 4: Parameter type and range validation in detect_kline_gaps."""
+        with self.assertRaises(TypeError):
+            detect_kline_gaps(123, "1h", [])  # type: ignore
+        with self.assertRaises(ValueError):
+            detect_kline_gaps("   ", "1h", [])
+        with self.assertRaises(TypeError):
+            detect_kline_gaps("BTCUSDT", "1h", [], expected_start_time=True)  # type: ignore
+        with self.assertRaises(ValueError):
+            detect_kline_gaps("BTCUSDT", "1h", [], expected_start_time=-1)
+        with self.assertRaises(TypeError):
+            detect_kline_gaps("BTCUSDT", "1h", [], expected_end_time=False)  # type: ignore
+        with self.assertRaises(ValueError):
+            detect_kline_gaps("BTCUSDT", "1h", [], expected_end_time=-5)
+        with self.assertRaises(ValueError):
+            detect_kline_gaps("BTCUSDT", "1h", [], expected_start_time=5000, expected_end_time=1000)
+        with self.assertRaises(ValueError):
+            detect_kline_gaps("BTCUSDT", "1h", [{"open_time": -100}])

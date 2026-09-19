@@ -41,10 +41,24 @@ class HistoricalKlineDownloader:
             request_delay_ms: Conservative pacing delay between paginated requests (ms).
             max_retries: Maximum retries for transient errors and HTTP 429 rate limits.
         """
+        if isinstance(request_delay_ms, bool) or not isinstance(request_delay_ms, (int, float)):
+            raise TypeError(
+                f"request_delay_ms must be a float or int, got {type(request_delay_ms).__name__}: {request_delay_ms!r}"
+            )
+        if request_delay_ms < 0:
+            raise ValueError(f"request_delay_ms must be non-negative, got: {request_delay_ms}")
+
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise TypeError(
+                f"max_retries must be an int, got {type(max_retries).__name__}: {max_retries!r}"
+            )
+        if max_retries < 0:
+            raise ValueError(f"max_retries must be non-negative, got: {max_retries}")
+
         self._db = db
         self._client = client
-        self._request_delay_ms = max(0.0, float(request_delay_ms))
-        self._max_retries = max(0, int(max_retries))
+        self._request_delay_ms = float(request_delay_ms)
+        self._max_retries = int(max_retries)
         self._last_headers: Dict[str, str] = {}
 
         # Attach telemetry response hook to the client session
@@ -188,7 +202,9 @@ class HistoricalKlineDownloader:
             DatabaseError: If database persistence fails.
         """
         # Validate symbol
-        if not symbol or not isinstance(symbol, str) or not symbol.strip():
+        if not isinstance(symbol, str):
+            raise TypeError(f"symbol must be a string, got {type(symbol).__name__}: {symbol!r}")
+        if not symbol.strip():
             raise ValueError("symbol must be a non-empty string.")
         sym = symbol.strip().upper()
 
@@ -204,12 +220,20 @@ class HistoricalKlineDownloader:
         interval_ms = interval_to_milliseconds(validated_interval)
 
         # Validate timestamps
-        if not isinstance(start_time, int) or start_time < 0:
+        if isinstance(start_time, bool) or not isinstance(start_time, int):
+            raise TypeError(f"start_time must be an integer, got {type(start_time).__name__}: {start_time!r}")
+        if start_time < 0:
             raise ValueError(f"start_time must be a non-negative integer, got: {start_time}")
-        if not isinstance(end_time, int) or end_time < 0:
+        if isinstance(end_time, bool) or not isinstance(end_time, int):
+            raise TypeError(f"end_time must be an integer, got {type(end_time).__name__}: {end_time!r}")
+        if end_time < 0:
             raise ValueError(f"end_time must be a non-negative integer, got: {end_time}")
         if start_time > end_time:
             raise ValueError(f"start_time ({start_time}) cannot be greater than end_time ({end_time})")
+
+        # Validate resume flag
+        if not isinstance(resume, bool):
+            raise TypeError(f"resume must be a bool, got {type(resume).__name__}: {resume!r}")
 
         start_perf = time.perf_counter()
         now_ms = int(time.time() * 1000)
@@ -291,6 +315,8 @@ class HistoricalKlineDownloader:
 
             effective_start_time = current_start_time
 
+            all_forming = False
+
             # Pagination Loop
             while current_start_time <= effective_end_time:
                 klines = self._fetch_klines_page(
@@ -315,11 +341,17 @@ class HistoricalKlineDownloader:
 
                 # Edge case: If every candle in the batch is forming, terminate safely
                 if not closed_klines:
+                    all_forming = True
                     logger.info(
                         "All %d returned candles are forming candles. Terminating pagination safely.",
                         len(klines),
                     )
                     break
+
+                # Ensure closed_klines are sorted chronologically
+                closed_klines.sort(
+                    key=lambda k: getattr(k, "open_time_ms", getattr(k, "open_time", 0))
+                )
 
                 # Transaction Boundary 1: Store canonical raw reconstruction
                 canonical_payload = json.dumps([k.raw for k in klines], separators=(",", ":"))
@@ -399,12 +431,21 @@ class HistoricalKlineDownloader:
                 self._handle_pacing_and_telemetry(self._request_delay_ms)
 
             # Continuity analysis across the examined sequence
+            exp_start: Optional[int] = None
+            exp_end: Optional[int] = None
+            if all_stored_klines:
+                exp_start = effective_start_time
+                exp_end = effective_end_time
+            elif effective_start_time <= effective_end_time and not all_forming:
+                exp_start = effective_start_time
+                exp_end = effective_end_time
+
             gap_report = detect_kline_gaps(
                 symbol=sym,
                 interval=validated_interval,
                 klines=all_stored_klines,
-                expected_start_time=effective_start_time if all_stored_klines else None,
-                expected_end_time=effective_end_time if all_stored_klines else None,
+                expected_start_time=exp_start,
+                expected_end_time=exp_end,
             )
 
             # Mark ingestion run completed

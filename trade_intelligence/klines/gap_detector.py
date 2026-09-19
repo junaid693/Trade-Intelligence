@@ -57,6 +57,28 @@ def detect_kline_gaps(
     Returns:
         GapReport with detected gaps, expected/actual counts, and coverage ratio.
     """
+    if not isinstance(symbol, str):
+        raise TypeError(f"symbol must be a string, got {type(symbol).__name__}")
+    if not symbol.strip():
+        raise ValueError("symbol cannot be empty or whitespace only")
+
+    if expected_start_time is not None:
+        if isinstance(expected_start_time, bool) or not isinstance(expected_start_time, int):
+            raise TypeError(f"expected_start_time must be an integer, got {type(expected_start_time).__name__}")
+        if expected_start_time < 0:
+            raise ValueError(f"expected_start_time must be non-negative, got {expected_start_time}")
+
+    if expected_end_time is not None:
+        if isinstance(expected_end_time, bool) or not isinstance(expected_end_time, int):
+            raise TypeError(f"expected_end_time must be an integer, got {type(expected_end_time).__name__}")
+        if expected_end_time < 0:
+            raise ValueError(f"expected_end_time must be non-negative, got {expected_end_time}")
+
+    if expected_start_time is not None and expected_end_time is not None and expected_start_time > expected_end_time:
+        raise ValueError(
+            f"expected_start_time ({expected_start_time}) cannot be greater than expected_end_time ({expected_end_time})"
+        )
+
     iv_str = KlineInterval.from_value(interval).value
     interval_ms = interval_to_milliseconds(iv_str)
 
@@ -67,15 +89,24 @@ def detect_kline_gaps(
             val = k.get("open_time") if "open_time" in k else k.get("open_time_ms")
             if val is None:
                 raise ValueError("Dict kline missing open_time or open_time_ms")
-            open_times.append(int(val))
+            ts = int(val)
+            if ts < 0:
+                raise ValueError(f"kline open_time must be non-negative, got: {ts}")
+            open_times.append(ts)
         elif hasattr(k, "open_time_ms"):
-            open_times.append(int(k.open_time_ms))
+            ts = int(k.open_time_ms)
+            if ts < 0:
+                raise ValueError(f"kline open_time_ms must be non-negative, got: {ts}")
+            open_times.append(ts)
         elif hasattr(k, "open_time"):
-            open_times.append(int(k.open_time))
+            ts = int(k.open_time)
+            if ts < 0:
+                raise ValueError(f"kline open_time must be non-negative, got: {ts}")
+            open_times.append(ts)
         else:
             raise TypeError(f"Unsupported kline item type: {type(k).__name__}")
 
-    open_times.sort()
+    open_times = sorted(set(open_times))
 
     gaps: List[KlineGap] = []
 
