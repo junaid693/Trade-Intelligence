@@ -409,6 +409,114 @@ class Database:
                 f"Failed to insert symbol '{sym}': {exc}"
             ) from exc
 
+    def get_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a single symbol record by symbol name.
+
+        Args:
+            symbol: Trading pair symbol (e.g. 'BTCUSDT').
+
+        Returns:
+            Dict of symbol attributes, or None if not found.
+
+        Raises:
+            DatabaseError: If the query fails.
+        """
+        sym = _validate_symbol(symbol)
+        conn = self.connection
+        try:
+            row = conn.execute(
+                """
+                SELECT symbol, base_asset, quote_asset, status,
+                       is_spot_trading_allowed, is_margin_trading_allowed,
+                       base_asset_precision, quote_asset_precision,
+                       updated_at, created_at
+                FROM symbols
+                WHERE symbol = ?;
+                """,
+                (sym,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "symbol": row["symbol"],
+                "base_asset": row["base_asset"],
+                "quote_asset": row["quote_asset"],
+                "status": row["status"],
+                "is_spot_trading_allowed": bool(row["is_spot_trading_allowed"]),
+                "is_margin_trading_allowed": bool(row["is_margin_trading_allowed"]),
+                "base_asset_precision": row["base_asset_precision"],
+                "quote_asset_precision": row["quote_asset_precision"],
+                "updated_at": row["updated_at"],
+                "created_at": row["created_at"],
+            }
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Failed to get symbol '{sym}': {exc}") from exc
+
+    def get_symbols(
+        self,
+        quote_asset: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve symbols, optionally filtered by quote asset.
+
+        Args:
+            quote_asset: Optional quote asset filter (e.g. 'USDT').
+
+        Returns:
+            List of symbol dicts ordered by symbol ascending.
+
+        Raises:
+            ValueError: If quote_asset is an empty string.
+            DatabaseError: If the query fails.
+        """
+        conn = self.connection
+        try:
+            if quote_asset is not None:
+                if not isinstance(quote_asset, str) or not quote_asset.strip():
+                    raise ValueError("quote_asset filter must be a non-empty string.")
+                qa = quote_asset.strip().upper()
+                rows = conn.execute(
+                    """
+                    SELECT symbol, base_asset, quote_asset, status,
+                           is_spot_trading_allowed, is_margin_trading_allowed,
+                           base_asset_precision, quote_asset_precision,
+                           updated_at, created_at
+                    FROM symbols
+                    WHERE quote_asset = ?
+                    ORDER BY symbol ASC;
+                    """,
+                    (qa,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT symbol, base_asset, quote_asset, status,
+                           is_spot_trading_allowed, is_margin_trading_allowed,
+                           base_asset_precision, quote_asset_precision,
+                           updated_at, created_at
+                    FROM symbols
+                    ORDER BY symbol ASC;
+                    """,
+                ).fetchall()
+            return [
+                {
+                    "symbol": row["symbol"],
+                    "base_asset": row["base_asset"],
+                    "quote_asset": row["quote_asset"],
+                    "status": row["status"],
+                    "is_spot_trading_allowed": bool(row["is_spot_trading_allowed"]),
+                    "is_margin_trading_allowed": bool(row["is_margin_trading_allowed"]),
+                    "base_asset_precision": row["base_asset_precision"],
+                    "quote_asset_precision": row["quote_asset_precision"],
+                    "updated_at": row["updated_at"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        except (ValueError, TypeError):
+            raise
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Failed to get symbols: {exc}") from exc
+
     # ------------------------------------------------------------------
     # Repository: symbol_status_events
     # ------------------------------------------------------------------
@@ -466,6 +574,56 @@ class Database:
             _rollback_quietly(conn)
             raise DatabaseError(
                 f"Failed to insert status event for '{sym}': {exc}"
+            ) from exc
+
+    def query_symbol_status_events(
+        self,
+        symbol: str,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Query status transition events for a symbol, newest first.
+
+        Args:
+            symbol: Trading pair symbol.
+            limit: Maximum number of events to return.
+
+        Returns:
+            List of event dicts ordered by effective_at DESC, id DESC.
+
+        Raises:
+            ValueError: If limit < 1.
+            DatabaseError: If the query fails.
+        """
+        sym = _validate_symbol(symbol)
+        lim = _validate_limit(limit)
+        conn = self.connection
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, status, is_spot_trading_allowed,
+                       effective_at, raw_response_id, created_at
+                FROM symbol_status_events
+                WHERE symbol = ?
+                ORDER BY effective_at DESC, id DESC
+                LIMIT ?;
+                """,
+                (sym, lim),
+            ).fetchall()
+            return [
+                {
+                    "id": row["id"],
+                    "symbol": row["symbol"],
+                    "status": row["status"],
+                    "is_spot_trading_allowed": bool(row["is_spot_trading_allowed"]),
+                    "effective_at": row["effective_at"],
+                    "raw_response_id": row["raw_response_id"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query status events for '{sym}': {exc}"
             ) from exc
 
     # ------------------------------------------------------------------
@@ -1090,6 +1248,186 @@ class Database:
             _rollback_quietly(conn)
             raise DatabaseError(
                 f"Failed to batch upsert symbols: {exc}"
+            ) from exc
+
+    def batch_insert_symbol_status_events(
+        self,
+        events: List[Dict[str, Any]],
+    ) -> int:
+        """Insert multiple symbol status transition events in a single transaction.
+
+        Args:
+            events: List of dicts, each with keys: ``symbol``, ``status``,
+                    ``is_spot_trading_allowed``, ``effective_at``, and
+                    optionally ``raw_response_id``.
+
+        Returns:
+            Count of events inserted.
+
+        Raises:
+            TypeError: If any event has an invalid type.
+            ValueError: If any event has an invalid value.
+            DatabaseIntegrityError: If a foreign key constraint is violated.
+            DatabaseError: If the batch operation fails.
+        """
+        if not events:
+            return 0
+
+        validated: List[Tuple] = []
+        for i, row in enumerate(events):
+            try:
+                sym = _validate_symbol(row["symbol"])
+                status = str(row["status"]).strip().upper()
+                if not status:
+                    raise ValueError("Status cannot be empty.")
+                is_spot = int(bool(row["is_spot_trading_allowed"]))
+                eff_at = _validate_timestamp(row["effective_at"], "effective_at")
+                raw_id = row.get("raw_response_id")
+                if raw_id is not None and (isinstance(raw_id, bool) or not isinstance(raw_id, int)):
+                    raise TypeError(
+                        f"raw_response_id must be an integer, got {type(raw_id).__name__}: {raw_id!r}"
+                    )
+                validated.append((sym, status, is_spot, eff_at, raw_id))
+            except KeyError as exc:
+                raise ValueError(
+                    f"Symbol status event row at index {i} is missing required field: {exc}"
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(
+                    f"Symbol status event row at index {i}: {exc}"
+                ) from exc
+
+        conn = self.connection
+        sql = """
+            INSERT INTO symbol_status_events
+                (symbol, status, is_spot_trading_allowed, effective_at, raw_response_id)
+            VALUES (?, ?, ?, ?, ?);
+        """
+        try:
+            conn.execute("BEGIN")
+            conn.executemany(sql, validated)
+            conn.execute("COMMIT")
+            return len(validated)
+        except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
+            raise DatabaseIntegrityError(
+                f"Integrity error in batch symbol status events insert: {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            _rollback_quietly(conn)
+            raise DatabaseError(
+                f"Failed to batch insert symbol status events: {exc}"
+            ) from exc
+
+    def batch_upsert_universe_state(
+        self,
+        symbols: List[Dict[str, Any]],
+        events: List[Dict[str, Any]],
+    ) -> Tuple[int, int]:
+        """Atomically upsert symbols and insert status events in a single transaction.
+
+        Validates all inputs before any database modification. Guarantees that
+        symbol updates and status events either both commit or both roll back.
+
+        Args:
+            symbols: List of symbol dicts for batch upsert.
+            events: List of status event dicts for batch insert.
+
+        Returns:
+            Tuple of (symbols_upserted_count, events_inserted_count).
+
+        Raises:
+            TypeError: If any row has an invalid type.
+            ValueError: If any row has an invalid value.
+            DatabaseIntegrityError: If a constraint violation occurs.
+            DatabaseError: If the transaction fails.
+        """
+        # Validate symbols
+        validated_symbols: List[Tuple] = []
+        for i, row in enumerate(symbols):
+            try:
+                sym = _validate_symbol(row["symbol"])
+                ts = _validate_timestamp(row["updated_at"], "updated_at")
+                validated_symbols.append((
+                    sym,
+                    row["base_asset"],
+                    row["quote_asset"],
+                    row["status"],
+                    int(row["is_spot_trading_allowed"]),
+                    int(row["is_margin_trading_allowed"]),
+                    row["base_asset_precision"],
+                    row["quote_asset_precision"],
+                    ts,
+                ))
+            except KeyError as exc:
+                raise ValueError(
+                    f"Symbol row at index {i} is missing required field: {exc}"
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"Symbol row at index {i}: {exc}") from exc
+
+        # Validate events
+        validated_events: List[Tuple] = []
+        for i, row in enumerate(events):
+            try:
+                sym = _validate_symbol(row["symbol"])
+                status = str(row["status"]).strip().upper()
+                if not status:
+                    raise ValueError("Status cannot be empty.")
+                is_spot = int(bool(row["is_spot_trading_allowed"]))
+                eff_at = _validate_timestamp(row["effective_at"], "effective_at")
+                raw_id = row.get("raw_response_id")
+                if raw_id is not None and (isinstance(raw_id, bool) or not isinstance(raw_id, int)):
+                    raise TypeError(
+                        f"raw_response_id must be an integer, got {type(raw_id).__name__}: {raw_id!r}"
+                    )
+                validated_events.append((sym, status, is_spot, eff_at, raw_id))
+            except KeyError as exc:
+                raise ValueError(
+                    f"Symbol status event row at index {i} is missing required field: {exc}"
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"Symbol status event row at index {i}: {exc}") from exc
+
+        conn = self.connection
+        symbols_sql = """
+            INSERT INTO symbols
+                (symbol, base_asset, quote_asset, status,
+                 is_spot_trading_allowed, is_margin_trading_allowed,
+                 base_asset_precision, quote_asset_precision, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (symbol) DO UPDATE SET
+                base_asset              = excluded.base_asset,
+                quote_asset             = excluded.quote_asset,
+                status                  = excluded.status,
+                is_spot_trading_allowed = excluded.is_spot_trading_allowed,
+                is_margin_trading_allowed = excluded.is_margin_trading_allowed,
+                base_asset_precision    = excluded.base_asset_precision,
+                quote_asset_precision   = excluded.quote_asset_precision,
+                updated_at              = excluded.updated_at;
+        """
+        events_sql = """
+            INSERT INTO symbol_status_events
+                (symbol, status, is_spot_trading_allowed, effective_at, raw_response_id)
+            VALUES (?, ?, ?, ?, ?);
+        """
+        try:
+            conn.execute("BEGIN")
+            if validated_symbols:
+                conn.executemany(symbols_sql, validated_symbols)
+            if validated_events:
+                conn.executemany(events_sql, validated_events)
+            conn.execute("COMMIT")
+            return (len(validated_symbols), len(validated_events))
+        except sqlite3.IntegrityError as exc:
+            _rollback_quietly(conn)
+            raise DatabaseIntegrityError(
+                f"Integrity error in batch universe state upsert: {exc}"
+            ) from exc
+        except sqlite3.Error as exc:
+            _rollback_quietly(conn)
+            raise DatabaseError(
+                f"Failed to batch upsert universe state: {exc}"
             ) from exc
 
     def batch_upsert_klines(

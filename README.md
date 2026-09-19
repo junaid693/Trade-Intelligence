@@ -6,13 +6,13 @@ Trade Intelligence is a private, Binance-only trading intelligence application. 
 
 - **Exchange**: Binance only
 - **Data Access**: Binance official public market-data APIs
-- **Database**: SQLite (Phase 1.3.2 foundation implemented)
+- **Database**: SQLite (Phase 1.3.2 foundation & Phase 1.3.3 batch operations implemented)
 - **Deployment**: Local initially
 - **Trading**: Completely disabled (no execution, order routing, or account management)
 - **API Credentials**: Not required (read-only public market data only)
 - **Out of Scope**: No AI/ML, trading recommendations, automated trading, technical analysis engines, candlestick detection, Binance Square integrations, WebSockets, Futures, or frontend.
 
-## Current State: Phase 1.3.2 (Completed)
+## Current State: Phase 1.4.1 (Completed)
 
 ### Phase 1.2 — Binance Spot REST Client
 - **Endpoints Supported**: Server time (`GET /api/v3/time`), exchange information (`GET /api/v3/exchangeInfo`), ticker prices (`GET /api/v3/ticker/price`), and kline/OHLCV data (`GET /api/v3/klines`).
@@ -29,6 +29,17 @@ Trade Intelligence is a private, Binance-only trading intelligence application. 
 - **Configurable Pragmas**: WAL journal mode, synchronous level, cache size, and busy timeout are centrally configurable.
 - **Upsert Support**: Forming candles may be updated via `ON CONFLICT DO UPDATE` while finalized historical candles remain effectively immutable.
 - **Repository Methods**: Insert/update symbols, status events, raw API responses, ingestion runs, klines (insert and upsert), ticker snapshots, and range/latest-N kline queries.
+
+### Phase 1.3.3 — Batch Insert / Upsert
+- **Batch Operations**: High-throughput batch methods for `symbols`, `klines`, `ticker_snapshots`, and `raw_api_responses`.
+- **Atomicity & Rollback**: Fail-fast validation with atomic `BEGIN` / `COMMIT` transactions and safe rollback on error.
+- **FK Preservation**: Uses `INSERT ... ON CONFLICT DO UPDATE` semantics to maintain foreign-key integrity across updates.
+
+### Phase 1.4.1 — Binance Spot Market Universe
+- **Authoritative Synchronization**: `UniverseSyncer` syncs the complete Binance Spot USDT universe directly from `GET /api/v3/exchangeInfo`.
+- **Dual Transaction Boundaries**: Raw API response archival committed in Boundary 1; normalized symbol state and status events committed atomically in Boundary 2.
+- **Idempotent Status Ledger**: Tracks initial discovery, trading status changes, and Spot permission transitions in `symbol_status_events` with zero duplicate events on repeat runs.
+- **Survivorship-Bias Protection**: Delisted or missing symbols are preserved in `symbols` as `DELISTED` (no deletions), maintaining referential integrity for all historical market data.
 
 ## Development Setup
 
@@ -75,7 +86,9 @@ Trade-Intelligence/
 │   ├── test_environment.py          # Environment & dependency sanity checks
 │   ├── test_binance_client.py       # Mocked offline unit tests
 │   ├── test_binance_integration.py  # Opt-in live Binance API integration tests
-│   └── test_database.py            # SQLite database foundation tests
+│   ├── test_database.py            # SQLite database foundation tests
+│   ├── test_universe_sync.py       # Universe synchronization unit tests
+│   └── test_universe_sync_integration.py # Opt-in live universe sync integration tests
 └── trade_intelligence/
     ├── __init__.py                  # Top-level exports
     ├── binance/
@@ -84,9 +97,12 @@ Trade-Intelligence/
     │   ├── enums.py                 # KlineInterval enumeration & validation
     │   ├── exceptions.py            # Custom exception hierarchy
     │   └── models.py                # Typed dataclasses (Decimal prices/volumes)
-    └── db/
-        ├── __init__.py              # Database module interface
-        ├── database.py              # Database class (connection, schema, repository)
-        ├── exceptions.py            # Database exception hierarchy
-        └── schema.py                # Phase 1.3.1 approved DDL & version constant
+    ├── db/
+    │   ├── __init__.py              # Database module interface
+    │   ├── database.py              # Database class (connection, schema, repository)
+    │   ├── exceptions.py            # Database exception hierarchy
+    │   └── schema.py                # Phase 1.3.1 approved DDL & version constant
+    └── universe/
+        ├── __init__.py              # Universe module interface
+        └── sync.py                  # UniverseSyncer implementation & SyncResult
 ```

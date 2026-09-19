@@ -1722,6 +1722,111 @@ class TestBatchOperations(unittest.TestCase):
             self.assertLess(elapsed, 2.0, f"1000 klines took {elapsed:.3f}s (> 2.0s)")
             db.close()
 
+    def test_batch_insert_symbol_status_events(self):
+        """Test batch insert of symbol status transition events."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            _insert_test_symbol(db, "ETHUSDT")
+
+            events = [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "TRADING",
+                    "is_spot_trading_allowed": True,
+                    "effective_at": 1700000000000,
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "status": "BREAK",
+                    "is_spot_trading_allowed": False,
+                    "effective_at": 1700000001000,
+                },
+            ]
+            count = db.batch_insert_symbol_status_events(events)
+            self.assertEqual(count, 2)
+
+            btc_events = db.query_symbol_status_events("BTCUSDT")
+            self.assertEqual(len(btc_events), 1)
+            self.assertEqual(btc_events[0]["status"], "TRADING")
+            self.assertTrue(btc_events[0]["is_spot_trading_allowed"])
+
+            eth_events = db.query_symbol_status_events("ETHUSDT")
+            self.assertEqual(len(eth_events), 1)
+            self.assertEqual(eth_events[0]["status"], "BREAK")
+            self.assertFalse(eth_events[0]["is_spot_trading_allowed"])
+            db.close()
+
+    def test_batch_insert_symbol_status_events_empty(self):
+        """Batch insert empty list returns 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            self.assertEqual(db.batch_insert_symbol_status_events([]), 0)
+            db.close()
+
+    def test_batch_insert_symbol_status_events_fk_violation(self):
+        """Batch insert with nonexistent symbol rolls back and raises."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            _insert_test_symbol(db, "BTCUSDT")
+            events = [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "TRADING",
+                    "is_spot_trading_allowed": True,
+                    "effective_at": 1700000000000,
+                },
+                {
+                    "symbol": "NONEXISTENT",
+                    "status": "TRADING",
+                    "is_spot_trading_allowed": True,
+                    "effective_at": 1700000001000,
+                },
+            ]
+            with self.assertRaises(DatabaseIntegrityError):
+                db.batch_insert_symbol_status_events(events)
+            # Verify rollback: BTCUSDT has 0 events
+            self.assertEqual(len(db.query_symbol_status_events("BTCUSDT")), 0)
+            db.close()
+
+    def test_get_symbol_and_get_symbols(self):
+        """Test get_symbol and get_symbols queries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_test_db(tmp)
+            self.assertIsNone(db.get_symbol("BTCUSDT"))
+
+            _insert_test_symbol(db, "BTCUSDT")
+            db.insert_symbol(
+                symbol="ETHBTC",
+                base_asset="ETH",
+                quote_asset="BTC",
+                status="TRADING",
+                is_spot_trading_allowed=True,
+                is_margin_trading_allowed=False,
+                base_asset_precision=8,
+                quote_asset_precision=8,
+                updated_at=1700000000000,
+            )
+
+            sym = db.get_symbol("btcusdt")
+            self.assertIsNotNone(sym)
+            self.assertEqual(sym["symbol"], "BTCUSDT")
+            self.assertEqual(sym["base_asset"], "BTC")
+            self.assertEqual(sym["quote_asset"], "USDT")
+
+            all_syms = db.get_symbols()
+            self.assertEqual(len(all_syms), 2)
+
+            usdt_syms = db.get_symbols(quote_asset="USDT")
+            self.assertEqual(len(usdt_syms), 1)
+            self.assertEqual(usdt_syms[0]["symbol"], "BTCUSDT")
+
+            btc_syms = db.get_symbols(quote_asset="BTC")
+            self.assertEqual(len(btc_syms), 1)
+            self.assertEqual(btc_syms[0]["symbol"], "ETHBTC")
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+

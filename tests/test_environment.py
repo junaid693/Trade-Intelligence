@@ -27,6 +27,12 @@ class TestEnvironment(unittest.TestCase):
         self.assertTrue(hasattr(trade_intelligence, "DatabaseInitError"))
         self.assertTrue(hasattr(trade_intelligence, "DatabaseIntegrityError"))
 
+    def test_universe_syncer_exported(self):
+        """Ensure UniverseSyncer and SyncResult are exported at package root."""
+        self.assertTrue(hasattr(trade_intelligence, "UniverseSyncer"))
+        self.assertTrue(hasattr(trade_intelligence, "SyncResult"))
+
 
 if __name__ == "__main__":
     unittest.main()
+
