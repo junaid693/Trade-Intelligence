@@ -138,37 +138,87 @@ class TestOrchestratorConstructor:
 # ---------------------------------------------------------------------------
 
 class TestRequestValidation:
-    def test_empty_symbols(self, db, mock_client, mock_downloader):
-        orch = HistoricalDataOrchestrator(db, mock_client, mock_downloader)
-        request = PipelineRequest(
-            symbols=[], intervals=["1h"], start_time=0, end_time=HOUR
-        )
+    def test_empty_symbols_construction(self):
         with pytest.raises(ValueError, match="symbols"):
-            orch.run(request)
+            PipelineRequest(
+                symbols=[], intervals=["1h"], start_time=0, end_time=HOUR
+            )
 
-    def test_invalid_interval(self, db, mock_client, mock_downloader):
-        orch = HistoricalDataOrchestrator(db, mock_client, mock_downloader)
-        request = PipelineRequest(
-            symbols=["BTCUSDT"], intervals=["2h"], start_time=0, end_time=HOUR
-        )
+    def test_invalid_symbol_string_construction(self):
+        with pytest.raises(ValueError, match="Each symbol must be a non-empty string"):
+            PipelineRequest(
+                symbols=["   "], intervals=["1h"], start_time=0, end_time=HOUR
+            )
+
+    def test_invalid_interval_construction(self):
         with pytest.raises(ValueError, match="Unsupported"):
-            orch.run(request)
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["2h"], start_time=0, end_time=HOUR
+            )
 
-    def test_bool_start_time(self, db, mock_client, mock_downloader):
-        orch = HistoricalDataOrchestrator(db, mock_client, mock_downloader)
-        request = PipelineRequest(
-            symbols=["BTCUSDT"], intervals=["1h"], start_time=True, end_time=HOUR
-        )
+    def test_bool_start_time_construction(self):
         with pytest.raises(TypeError, match="start_time"):
-            orch.run(request)
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=True, end_time=1000
+            )
 
-    def test_start_gte_end(self, db, mock_client, mock_downloader):
-        orch = HistoricalDataOrchestrator(db, mock_client, mock_downloader)
-        request = PipelineRequest(
-            symbols=["BTCUSDT"], intervals=["1h"], start_time=HOUR, end_time=HOUR
-        )
+    def test_bool_end_time_construction(self):
+        with pytest.raises(TypeError, match="end_time"):
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=0, end_time=True
+            )
+
+    def test_negative_start_time_construction(self):
+        with pytest.raises(ValueError, match="start_time must be non-negative"):
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=-1, end_time=HOUR
+            )
+
+    def test_start_gte_end_construction(self):
         with pytest.raises(ValueError, match="start_time.*<.*end_time"):
-            orch.run(request)
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=HOUR, end_time=HOUR
+            )
+
+    def test_download_before_scan_strict_bool_string(self):
+        with pytest.raises(TypeError, match="download_before_scan must be bool"):
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=0, end_time=HOUR,
+                download_before_scan="false",
+            )
+
+    def test_download_before_scan_strict_bool_int(self):
+        with pytest.raises(TypeError, match="download_before_scan must be bool"):
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=0, end_time=HOUR,
+                download_before_scan=1,
+            )
+
+    def test_repair_gaps_strict_bool_string(self):
+        with pytest.raises(TypeError, match="repair_gaps must be bool"):
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=0, end_time=HOUR,
+                repair_gaps="false",
+            )
+
+    def test_repair_gaps_strict_bool_int(self):
+        with pytest.raises(TypeError, match="repair_gaps must be bool"):
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=0, end_time=HOUR,
+                repair_gaps=1,
+            )
+
+    def test_invalid_config_type(self):
+        with pytest.raises(TypeError, match="config must be PipelineConfig"):
+            PipelineRequest(
+                symbols=["BTCUSDT"], intervals=["1h"], start_time=0, end_time=HOUR,
+                config="invalid_config",
+            )
+
+    def test_orchestrator_rejects_non_pipeline_request(self, db, mock_client, mock_downloader):
+        orch = HistoricalDataOrchestrator(db, mock_client, mock_downloader)
+        with pytest.raises(TypeError, match="PipelineRequest"):
+            orch.run("not_a_pipeline_request")
 
 
 # ---------------------------------------------------------------------------

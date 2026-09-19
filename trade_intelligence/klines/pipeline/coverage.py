@@ -156,6 +156,7 @@ class CoverageScanner:
         leading: List[CoverageGap] = []
         interior: List[CoverageGap] = []
         trailing: List[CoverageGap] = []
+        full_range: List[CoverageGap] = []
 
         if actual == 0:
             # Entire range is missing
@@ -168,7 +169,7 @@ class CoverageScanner:
                     gap_end_open_time_ms=aligned_end,
                     missing_candles=expected,
                 )
-                leading.append(gap)
+                full_range.append(gap)
         else:
             # Leading gap
             if open_times[0] > aligned_start:
@@ -212,7 +213,7 @@ class CoverageScanner:
                         missing_candles=missing_trail,
                     ))
 
-        all_gaps = leading + interior + trailing
+        all_gaps = leading + interior + trailing + full_range
         missing = sum(g.missing_candles for g in all_gaps)
         ratio = (actual / expected) if expected > 0 else 1.0
 
@@ -231,5 +232,6 @@ class CoverageScanner:
             leading_gaps=leading,
             interior_gaps=interior,
             trailing_gaps=trailing,
+            full_range_gaps=full_range,
             all_gaps=all_gaps,
         )

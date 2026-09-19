@@ -17,6 +17,7 @@ from trade_intelligence.klines.pipeline.types import (
     RepairSegmentResult,
     RepairStatus,
     TimeframeResult,
+    validate_pipeline_request,
 )
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "RepairSegmentResult",
     "RepairStatus",
     "TimeframeResult",
+    "validate_pipeline_request",
 ]

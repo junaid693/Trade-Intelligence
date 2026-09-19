@@ -194,6 +194,8 @@ class TestOfflinePipelineIntegration:
         assert report.expected_candles == 6
         assert len(report.all_gaps) == 1
         assert report.all_gaps[0].gap_type == GapType.FULL_RANGE
+        assert len(report.full_range_gaps) == 1
+        assert len(report.leading_gaps) == 0
 
         segments = GapRepairer.plan_repair_segments(report)
         assert len(segments) == 1

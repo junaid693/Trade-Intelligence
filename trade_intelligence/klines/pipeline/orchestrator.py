@@ -25,6 +25,7 @@ from trade_intelligence.klines.pipeline.types import (
     PipelineStatus,
     RepairStatus,
     TimeframeResult,
+    validate_pipeline_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,34 +69,7 @@ class HistoricalDataOrchestrator:
     @staticmethod
     def _validate_request(request: PipelineRequest) -> None:
         """Raise ``TypeError`` / ``ValueError`` on invalid request fields."""
-        if not isinstance(request, PipelineRequest):
-            raise TypeError(f"request must be a PipelineRequest, got {type(request).__name__}")
-
-        if not request.symbols or not isinstance(request.symbols, (list, tuple)):
-            raise ValueError("symbols must be a non-empty list or tuple")
-        for s in request.symbols:
-            if not isinstance(s, str) or not s.strip():
-                raise ValueError(f"Each symbol must be a non-empty string, got: {s!r}")
-
-        if not request.intervals or not isinstance(request.intervals, (list, tuple)):
-            raise ValueError("intervals must be a non-empty list or tuple")
-        for iv in request.intervals:
-            KlineInterval.from_value(iv)  # raises ValueError on invalid
-
-        if isinstance(request.start_time, bool) or not isinstance(request.start_time, int):
-            raise TypeError(f"start_time must be int, got {type(request.start_time).__name__}")
-        if request.start_time < 0:
-            raise ValueError(f"start_time must be non-negative, got {request.start_time}")
-
-        if isinstance(request.end_time, bool) or not isinstance(request.end_time, int):
-            raise TypeError(f"end_time must be int, got {type(request.end_time).__name__}")
-        if request.end_time < 0:
-            raise ValueError(f"end_time must be non-negative, got {request.end_time}")
-
-        if request.start_time >= request.end_time:
-            raise ValueError(
-                f"start_time ({request.start_time}) must be < end_time ({request.end_time})"
-            )
+        validate_pipeline_request(request)
 
     # ------------------------------------------------------------------
     # Single-pair execution

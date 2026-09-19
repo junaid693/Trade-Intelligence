@@ -261,6 +261,36 @@ class TestCoverageScanFullRange:
         assert report.missing_candles == 6
         assert len(report.all_gaps) == 1
         assert report.all_gaps[0].gap_type == GapType.FULL_RANGE
+        assert len(report.full_range_gaps) == 1
+        assert report.full_range_gaps[0] == report.all_gaps[0]
+        assert len(report.leading_gaps) == 0
+        assert len(report.interior_gaps) == 0
+        assert len(report.trailing_gaps) == 0
+
+    def test_full_range_gap_semantics_regression(self, db, scanner):
+        """FINDING-001 regression test:
+        1. Empty requested range with expected > 0 produces exactly one full_range gap.
+        2. report.full_range_gaps contains that gap.
+        3. report.leading_gaps is empty.
+        4. report.all_gaps contains the gap.
+        5. gap_type == GapType.FULL_RANGE.
+        """
+        _seed_symbol(db)
+        report = scanner.scan_coverage("BTCUSDT", "1h", 0, 5 * HOUR)
+
+        # 1. Exactly one full_range gap
+        assert len(report.full_range_gaps) == 1
+        gap = report.full_range_gaps[0]
+        # 2. report.full_range_gaps contains that gap
+        assert gap == report.full_range_gaps[0]
+        # 3. report.leading_gaps is empty
+        assert len(report.leading_gaps) == 0
+        assert report.leading_gaps == []
+        # 4. report.all_gaps contains the gap
+        assert gap in report.all_gaps
+        assert len(report.all_gaps) == 1
+        # 5. gap_type == GapType.FULL_RANGE
+        assert gap.gap_type == GapType.FULL_RANGE
 
 
 class TestCoverageScanFormingCandle:

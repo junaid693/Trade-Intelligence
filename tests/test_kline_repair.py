@@ -176,7 +176,7 @@ class TestPlanRepairSegments:
             aligned_start_ms=0, aligned_end_ms=5 * HOUR,
             expected_candles=6, actual_candles=0, missing_candles=6,
             coverage_ratio=0.0, is_complete=False,
-            leading_gaps=[gap], all_gaps=[gap],
+            full_range_gaps=[gap], all_gaps=[gap],
         )
         segments = GapRepairer.plan_repair_segments(report)
         assert len(segments) == 1
