@@ -12,7 +12,7 @@ Trade Intelligence is a private, Binance-only trading intelligence application. 
 - **API Credentials**: Not required (read-only public market data only)
 - **Out of Scope**: No AI/ML, trading recommendations, automated trading, technical analysis engines, candlestick detection, Binance Square integrations, WebSockets, Futures, or frontend.
 
-## Current State: Phase 1.4.2 (Completed)
+## Current State: Phase 1.4.3 (Completed)
 
 ### Phase 1.2 — Binance Spot REST Client
 - **Endpoints Supported**: Server time (`GET /api/v3/time`), exchange information (`GET /api/v3/exchangeInfo`), ticker prices (`GET /api/v3/ticker/price`), and kline/OHLCV data (`GET /api/v3/klines`).
@@ -50,6 +50,16 @@ Trade Intelligence is a private, Binance-only trading intelligence application. 
 - **Adaptive Rate Limiting & Telemetry**: Dynamic inspection of `X-MBX-USED-WEIGHT-*` headers, conservative configurable pacing delay, and HTTP 429 backoff with `Retry-After`.
 - **Provenance & Fault Isolation**: Commits canonical reconstructions of API payloads into `raw_api_responses` per page before batch-upserting normalized candles into `klines`, preserving full transaction boundaries.
 
+### Phase 1.4.3 — Multi-Timeframe Historical Pipeline
+- **Multi-Timeframe Historical Orchestration**: Sequential coordination across supported timeframes (`1d`, `4h`, `1h`, `15m`, `5m`) via `HistoricalDataOrchestrator`.
+- **Symbol-First Sequential Execution**: Orchestration processes each symbol completely through all requested intervals before proceeding to the next symbol, ensuring bounded memory usage and predictable execution.
+- **Coverage Scanning**: `CoverageScanner` calculates expected candle grids, aligns timestamp boundaries to timeframe multiples, and evaluates complete vs missing data.
+- **Gap Classification**: Categorizes detected continuity gaps into `LEADING`, `INTERIOR`, `TRAILING`, and `FULL_RANGE` gap types.
+- **Targeted Gap Repair**: `GapRepairer` constructs bounded `RepairSegment`s and executes targeted downloads through `HistoricalKlineDownloader` with zero duplicated retry logic.
+- **Post-Repair Verification**: Re-scans repaired intervals to verify data continuity and classify any residual gaps.
+- **Strict Request Validation**: `validate_pipeline_request` enforces fail-fast checking on `PipelineRequest` (rejecting boolean timestamps, truthy non-booleans, and invalid intervals/ranges).
+- **Independent 3-Axis Statuses**: Decoupled `DownloadStatus`, `CoverageStatus`, and `RepairStatus` for transparent operational diagnostics.
+
 ## Development Setup
 
 ### 1. Prerequisites
@@ -69,20 +79,46 @@ source .venv/bin/activate
 ```
 
 ### 3. Install Dependencies
+
+#### Runtime / Production Dependencies
+Install minimal runtime dependencies for the core application:
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 4. Running Tests
-Run the deterministic offline unit test suite:
+#### Development & Testing Dependencies
+Install test execution tools (`pytest`):
 ```powershell
-python -m unittest discover -s tests
+pip install -r requirements-dev.txt
+```
+
+### 4. Running Tests
+
+The full test suite relies on `pytest` for test discovery, fixtures, and parameterized execution across both unit and pipeline test suites.
+
+Run the complete deterministic offline test suite:
+```powershell
+pytest
+```
+or via Python module runner:
+```powershell
+python -m pytest
 ```
 
 Run the live Binance integration tests (opt-in, requires internet connectivity):
 ```powershell
-$env:RUN_LIVE_TESTS="1"; python -m unittest tests/test_binance_integration.py
+$env:RUN_LIVE_TESTS="1"; pytest
 ```
+or on Linux/macOS:
+```bash
+RUN_LIVE_TESTS="1" pytest
+```
+
+Standard library `unittest` may also be used to execute individual unittest-compatible modules:
+```powershell
+python -m unittest tests/test_database.py
+```
+*(Note: Full discovery of all 237 tests requires `pytest` because Phase 1.4.3 test modules use pytest features.)*
 
 ## Project Structure
 ```text
@@ -90,6 +126,7 @@ Trade-Intelligence/
 ├── .gitignore                          # Git exclusion rules
 ├── README.md                           # Project documentation
 ├── requirements.txt                    # Minimal dependencies for Binance public API
+├── requirements-dev.txt                # Development and test dependencies (pytest)
 ├── tests/
 │   ├── __init__.py
 │   ├── test_environment.py          # Environment & dependency sanity checks
@@ -99,7 +136,12 @@ Trade-Intelligence/
 │   ├── test_universe_sync.py       # Universe synchronization unit tests
 │   ├── test_universe_sync_integration.py # Opt-in live universe sync integration tests
 │   ├── test_kline_downloader.py    # Historical kline downloader unit tests
-│   └── test_kline_downloader_integration.py # Opt-in live kline download integration tests
+│   ├── test_kline_downloader_integration.py # Opt-in live kline download integration tests
+│   ├── test_kline_coverage.py      # Kline coverage scanner & alignment tests
+│   ├── test_kline_repair.py        # Gap repair planning & execution tests
+│   ├── test_kline_orchestrator.py  # Multi-timeframe orchestrator unit tests
+│   ├── test_kline_orchestrator_integration.py # Multi-timeframe pipeline integration tests
+│   └── test_system_integration.py  # End-to-end full system integration tests
 └── trade_intelligence/
     ├── __init__.py                  # Top-level exports
     ├── binance/
@@ -117,7 +159,13 @@ Trade-Intelligence/
     │   ├── __init__.py              # Klines module interface
     │   ├── downloader.py            # HistoricalKlineDownloader implementation
     │   ├── gap_detector.py          # Chronological gap detection & validation
-    │   └── types.py                 # DownloadResult, GapReport, KlineGap dataclasses
+    │   ├── types.py                 # DownloadResult, GapReport, KlineGap dataclasses
+    │   └── pipeline/
+    │       ├── __init__.py          # Pipeline module interface
+    │       ├── coverage.py          # CoverageScanner & timestamp alignment
+    │       ├── orchestrator.py      # HistoricalDataOrchestrator implementation
+    │       ├── repair.py            # GapRepairer planning & execution
+    │       └── types.py             # Pipeline request/result dataclasses & enums
     └── universe/
         ├── __init__.py              # Universe module interface
         └── sync.py                  # UniverseSyncer implementation & SyncResult
