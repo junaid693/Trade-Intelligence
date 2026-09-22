@@ -1,2 +1,4 @@
 # Initial Binance public market-data API connection dependency
 requests>=2.32.0
+# Feature engine and numerical calculation dependency (Phase 2)
+numpy>=1.26.0
