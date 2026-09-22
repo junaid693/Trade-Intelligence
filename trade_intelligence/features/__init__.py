@@ -33,6 +33,27 @@ from trade_intelligence.features.validation import (
     validate_candle,
     validate_candle_sequence,
 )
+from trade_intelligence.features.kernels import (
+    calc_atr,
+    calc_bollinger_bands,
+    calc_ema,
+    calc_ema_slope,
+    calc_ema_spread,
+    calc_macd,
+    calc_natr,
+    calc_price_ema_ratio,
+    calc_roc,
+    calc_rsi,
+    calc_rvol,
+    calc_taker_buy_share,
+    calc_true_range,
+    calc_volume_sma,
+    compute_all_kernels,
+    compute_momentum_features,
+    compute_trend_features,
+    compute_volatility_features,
+    compute_volume_features,
+)
 
 __all__ = [
     # Types & Models
@@ -65,4 +86,24 @@ __all__ = [
     "validate_candle_sequence",
     "convert_candles_to_arrays",
     "partition_contiguous_segments",
+    # Kernels & Calculation
+    "compute_all_kernels",
+    "calc_ema",
+    "calc_price_ema_ratio",
+    "calc_ema_spread",
+    "calc_ema_slope",
+    "calc_rsi",
+    "calc_macd",
+    "calc_roc",
+    "calc_true_range",
+    "calc_atr",
+    "calc_natr",
+    "calc_bollinger_bands",
+    "calc_volume_sma",
+    "calc_rvol",
+    "calc_taker_buy_share",
+    "compute_trend_features",
+    "compute_momentum_features",
+    "compute_volatility_features",
+    "compute_volume_features",
 ]
