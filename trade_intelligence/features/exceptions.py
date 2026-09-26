@@ -47,3 +47,7 @@ class InvalidTimestampError(FeatureValidationError):
 
 class LookaheadViolationError(FeatureError):
     """Raised when an operation would violate point-in-time / no-lookahead invariants."""
+
+
+class FeatureAssemblyError(FeatureError):
+    """Raised when feature assembly or FeatureMatrix construction fails validation."""

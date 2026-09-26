@@ -5,6 +5,7 @@ from trade_intelligence.features.exceptions import (
     CorruptedCandleValueError,
     DuplicateTimestampError,
     EmptySequenceError,
+    FeatureAssemblyError,
     FeatureError,
     FeatureValidationError,
     FormingCandleError,
@@ -15,6 +16,9 @@ from trade_intelligence.features.exceptions import (
     UnsortedSequenceError,
 )
 from trade_intelligence.features.types import (
+    CANONICAL_FEATURE_NAMES,
+    FEATURE_FIRST_VALID_INDICES,
+    FEATURE_WARMUP_THRESHOLDS,
     CandleSegment,
     FeatureCandle,
     FeatureMatrix,
@@ -23,6 +27,7 @@ from trade_intelligence.features.types import (
     MomentumSpec,
     NumericalCandleArrays,
     StructureSpec,
+    TechnicalFeaturesSpec,
     TrendSpec,
     VolatilitySpec,
     VolumeSpec,
@@ -54,6 +59,12 @@ from trade_intelligence.features.kernels import (
     compute_volatility_features,
     compute_volume_features,
 )
+from trade_intelligence.features.assembly import (
+    assemble_feature_matrix,
+    assemble_features_for_segment,
+    assemble_features_from_candles,
+    assemble_features_from_segments,
+)
 
 __all__ = [
     # Types & Models
@@ -68,9 +79,15 @@ __all__ = [
     "VolumeSpec",
     "FeatureMetadata",
     "FeatureMatrix",
+    # Unit 2.3 Constants & Specs
+    "CANONICAL_FEATURE_NAMES",
+    "FEATURE_FIRST_VALID_INDICES",
+    "FEATURE_WARMUP_THRESHOLDS",
+    "TechnicalFeaturesSpec",
     # Exceptions
     "FeatureError",
     "FeatureValidationError",
+    "FeatureAssemblyError",
     "EmptySequenceError",
     "UnsortedSequenceError",
     "DuplicateTimestampError",
@@ -106,4 +123,9 @@ __all__ = [
     "compute_momentum_features",
     "compute_volatility_features",
     "compute_volume_features",
+    # Assembly (Unit 2.3)
+    "assemble_feature_matrix",
+    "assemble_features_for_segment",
+    "assemble_features_from_candles",
+    "assemble_features_from_segments",
 ]

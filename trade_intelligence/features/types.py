@@ -475,3 +475,169 @@ class FeatureMatrix:
 
     def __len__(self) -> int:
         return len(self.open_times)
+
+
+# =============================================================================
+# Unit 2.3 — Canonical Feature Constants & Assembly Contracts
+# =============================================================================
+
+CANONICAL_FEATURE_NAMES: Tuple[str, ...] = (
+    # Trend (12)
+    "ema20", "ema50", "ema200",
+    "ratio_close_ema20", "ratio_close_ema50", "ratio_close_ema200",
+    "spread_ema20_50", "spread_ema50_200", "spread_ema20_200",
+    "slope_ema20", "slope_ema50", "slope_ema200",
+    # Momentum (8)
+    "rsi14",
+    "macd_line", "macd_signal", "macd_hist",
+    "macd_norm", "macd_hist_norm",
+    "roc10", "roc21",
+    # Volatility (7)
+    "atr14", "natr14",
+    "bb_upper", "bb_mid", "bb_lower", "bb_pct_b", "bb_bandwidth",
+    # Volume (3)
+    "vol_sma20", "rvol20", "taker_buy_share",
+)
+
+assert len(CANONICAL_FEATURE_NAMES) == 30, f"Expected 30 canonical features, got {len(CANONICAL_FEATURE_NAMES)}"
+
+# Mathematical availability: the earliest 0-indexed row where a finite value
+# can appear for each feature on a single contiguous segment.
+FEATURE_FIRST_VALID_INDICES: Dict[str, int] = {
+    # Trend — EMA(N): first valid at N-1
+    "ema20": 19,
+    "ema50": 49,
+    "ema200": 199,
+    # Ratios inherit the EMA availability
+    "ratio_close_ema20": 19,
+    "ratio_close_ema50": 49,
+    "ratio_close_ema200": 199,
+    # Spreads: max(fast, slow) availability
+    "spread_ema20_50": 49,
+    "spread_ema50_200": 199,
+    "spread_ema20_200": 199,
+    # Slopes: EMA availability + slope_k (3)
+    "slope_ema20": 22,
+    "slope_ema50": 52,
+    "slope_ema200": 202,
+    # RSI(14): first valid at index 14 (needs 15 candles / 14 deltas)
+    "rsi14": 14,
+    # MACD line: first valid at slow_period-1 = 25
+    "macd_line": 25,
+    # MACD signal: first valid at 25 + signal_period - 1 = 33
+    "macd_signal": 33,
+    "macd_hist": 33,
+    # Normalized MACD: same as MACD line
+    "macd_norm": 25,
+    "macd_hist_norm": 33,
+    # ROC(N): first valid at N
+    "roc10": 10,
+    "roc21": 21,
+    # ATR(14): first valid at period = 14 (needs period+1 candles, seed uses TR[1:period+1])
+    "atr14": 14,
+    "natr14": 14,
+    # Bollinger Bands(20): first valid at period-1 = 19
+    "bb_upper": 19,
+    "bb_mid": 19,
+    "bb_lower": 19,
+    "bb_pct_b": 19,
+    "bb_bandwidth": 19,
+    # Volume SMA(20): first valid at period-1 = 19
+    "vol_sma20": 19,
+    "rvol20": 19,
+    # Taker buy share: valid from index 0 (point-in-time ratio)
+    "taker_buy_share": 0,
+}
+
+# Stabilization / convergence warm-up threshold.
+# For recursive (convergence-sensitive) indicators: 3 × N.
+# For non-recursive (lookback-only) indicators: same as first_valid_index.
+FEATURE_WARMUP_THRESHOLDS: Dict[str, int] = {
+    # Recursive EMA-based (3 × period)
+    "ema20": 60,
+    "ema50": 150,
+    "ema200": 600,
+    # Ratios inherit EMA warm-up
+    "ratio_close_ema20": 60,
+    "ratio_close_ema50": 150,
+    "ratio_close_ema200": 600,
+    # Spreads: max warm-up of constituent EMAs
+    "spread_ema20_50": 150,
+    "spread_ema50_200": 600,
+    "spread_ema20_200": 600,
+    # Slopes: EMA warm-up + slope_k (3)
+    "slope_ema20": 63,
+    "slope_ema50": 153,
+    "slope_ema200": 603,
+    # RSI(14) recursive Wilder smoothing: 3 × 14 = 42
+    "rsi14": 42,
+    # MACD line: max of recursive EMAs = 3 × 26 = 78
+    "macd_line": 78,
+    # MACD signal: MACD warm-up + 3 × signal_period = 78 + 27 = 105
+    "macd_signal": 105,
+    "macd_hist": 105,
+    # Normalized MACD: same as MACD line warm-up
+    "macd_norm": 78,
+    "macd_hist_norm": 105,
+    # ROC is non-recursive: same as first_valid
+    "roc10": 10,
+    "roc21": 21,
+    # ATR(14) recursive Wilder: 3 × 14 = 42
+    "atr14": 42,
+    "natr14": 42,
+    # Bollinger Bands are non-recursive (rolling window): same as first_valid
+    "bb_upper": 19,
+    "bb_mid": 19,
+    "bb_lower": 19,
+    "bb_pct_b": 19,
+    "bb_bandwidth": 19,
+    # Volume SMA is non-recursive: same as first_valid
+    "vol_sma20": 19,
+    "rvol20": 19,
+    # Taker buy share: non-recursive
+    "taker_buy_share": 0,
+}
+
+# Ensure both dictionaries cover exactly the canonical set
+assert set(FEATURE_FIRST_VALID_INDICES.keys()) == set(CANONICAL_FEATURE_NAMES)
+assert set(FEATURE_WARMUP_THRESHOLDS.keys()) == set(CANONICAL_FEATURE_NAMES)
+
+
+@dataclass(frozen=True)
+class TechnicalFeaturesSpec:
+    """Unified specification combining all four feature family specs.
+
+    Provides a single ``spec_hash`` covering the entire 30-feature configuration,
+    and per-family ``FeatureSpec`` objects for traceability.
+    """
+
+    trend: TrendSpec = field(default_factory=TrendSpec)
+    momentum: MomentumSpec = field(default_factory=MomentumSpec)
+    volatility: VolatilitySpec = field(default_factory=VolatilitySpec)
+    volume: VolumeSpec = field(default_factory=VolumeSpec)
+    version: str = "2.3.0"
+
+    def family_specs(self) -> Dict[str, FeatureSpec]:
+        """Return a dictionary of per-family FeatureSpec objects."""
+        return {
+            "trend": self.trend.to_feature_spec(),
+            "momentum": self.momentum.to_feature_spec(),
+            "volatility": self.volatility.to_feature_spec(),
+            "volume": self.volume.to_feature_spec(),
+        }
+
+    def canonical_dict(self) -> Dict[str, Any]:
+        """Return a sorted, normalized dictionary for deterministic hashing."""
+        families = self.family_specs()
+        return {
+            "families": {k: _canonicalize_value(v.canonical_dict()) for k, v in sorted(families.items())},
+            "feature_names": list(CANONICAL_FEATURE_NAMES),
+            "version": self.version,
+        }
+
+    @property
+    def spec_hash(self) -> str:
+        """Deterministic 64-character hexadecimal SHA-256 hash."""
+        canonical = self.canonical_dict()
+        serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
